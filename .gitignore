@@ -186,7 +186,7 @@ cython_debug/
 #   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #   and can be added to the global gitignore or merged into this file.  For a more nuclear
 #   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
+.idea/
 
 # Abstra
 #   Abstra is an AI-powered process automation framework.
@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# boyak-be 전용
+# FastSAM-s.pt : 첫 실행 시 자동 다운로드되는 모델 가중치 (23MB, 코드 아님)
+FastSAM-s.pt
+*.pt
+# storage/ : 업로드된 이미지, 교정 마스크, 학습 데이터 로그 (런타임 산출물)
+/storage/

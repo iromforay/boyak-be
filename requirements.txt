@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+PyMySQL
+python-dotenv
+torch==2.4.1
+torchvision==0.19.1
+numpy
+opencv-python
+pytesseract
+ultralytics
