@@ -9,14 +9,12 @@ https://www.data.go.kr/data/15057639/openapi.do#/API%20%EB%AA%A9%EB%A1%9D/getMdc
 */
 date_default_timezone_set("Asia/Seoul");
 include "connect.php";
-include "Class_product.php";
 include "Class_common.php";
 
 class Medicine{
     private $domain;
     private $get_product; //조회
-    private $product; //DB 처리 class
-    private $common; //db 처리 - common table
+    private $common; //db 처리 - common table (수집 진행 상태만 기록)
     private $stock_product; //재고변경
     private $serviceKey;
     /*
@@ -39,7 +37,6 @@ class Medicine{
         $this->header='-H "Shopkey:6699ebffcaa6a22a1a6d94b44480b4b1" -H "Licensekey:NDg5NTZkNDk2NzE5YzMwMjgxNzgzMjY3YTQ1NTM0MmU="';
         */
         $link = get_connect();
-        $this->product = new Product($link);
         $this->common = new Common($link);
         return $this;
     }
@@ -90,14 +87,15 @@ class Medicine{
                 }
             }else{
                 $fail_streak = 0;
+                $this->down($result);
             }
         }
     }
     public function once($code)
     {
 
-        $this->curl($this->get_product."item_seq=".$code."&",0,0);
-
+        $result =  $this->curl($this->get_product."item_seq=".$code."&",0,0);
+        $this->down($result);
         exit;
     }
     private function curl($url , $page=1, $numOfRows = 300, $retry=3)
@@ -150,42 +148,28 @@ class Medicine{
             // $this->common->setKey('numOfRows',$data->body->numOfRows);
 
             if(isset($data->body->items)){
-                $items = $data->body->items;
-                echo "items count:".count($items)."\n";
-                //   print_r($items); echo "\n";
-                $this->set_product($items);
+                echo "items count:".count($data->body->items)."\n";
             }
 
 
         }
 
+        return $data;
     }
-    private function set_product($items)
+    // curl()이 받아온 API 응답(페이지 1건, 최대 300개 아이템)을 통째로
+    // storage/data/[Y-m-d]/page_{pageNo}.json 으로 저장한다. (건별이 아니라 페이지 단위 - 쓰기 횟수를 줄이기 위함)
+    // DB 처리(캐시 체크, insert/update)는 여기서 하지 않는다 - 별도 파싱 단계(run_parse)의 몫.
+    public function down($result)
     {
-        foreach($items as $key =>$item ){
-            // echo "ITEM_SEQ : ".$item->ITEM_SEQ." , item name :".serialize($item)."\n";
-            $this->product->set_product($item->ITEM_SEQ,serialize($item) );
-            //$this->product->cache($item->ITEM_SEQ,serialize($item) );
-            $this->get_image($item->ITEM_IMAGE,$item->ITEM_SEQ);
+        if(! is_object($result) || ! isset($result->body->items)) return $this;
 
-        }
-    }
-    private function get_image($image,$seq)
-    {
-        $dir = __DIR__;
-        $img_dir = $dir."\..\storage\drug_image";
-        $image_name=$seq.".jpg";
+        $dir = __DIR__."\..\storage\data\\".date("Y-m-d");
+        if(! is_dir($dir)) mkdir($dir, 0777, true);
 
-        if(PHP_OS =="WINNT"){
-            $cmd = "powershell -Command \"Invoke-WebRequest ".$image." -OutFile ".$img_dir."\\".$image_name."\"";
-        }else{
-            $cmd = "wget ".$image." ".$img_dir."\\".$image_name;
-        }
-        if(is_file($img_dir."\\".$image_name)) unlink($img_dir."\\".$image_name);
-        echo "command : ".$cmd."\n";
-        shell_exec($cmd);
-
+        $pageNo = isset($result->body->pageNo) ? $result->body->pageNo : 0;
+        $file = $dir."\\page_".sprintf("%03d",$pageNo).".json";
+        file_put_contents($file, json_encode($result->body->items, JSON_UNESCAPED_UNICODE));
+        echo "저장 : ".$file."\n";
         return $this;
     }
-
 }

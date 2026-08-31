@@ -66,7 +66,7 @@ class Product {
     public function set_product($key,$val)
     {
         $code = $this->cache($key,$val); // insert : 캐쉬추가, update: 캐쉬수정
-        $data = unserialize($val);
+        $data = json_decode($val);
 
         if($code == "none"){//등록 데이터와 동일
             echo $key." .. pass \n";
