@@ -22,6 +22,11 @@ fi
 
 echo "== 파이썬 패키지 설치 =="
 venv/bin/pip install --upgrade pip
+# torch를 그냥 requirements.txt로 설치하면 CUDA(GPU)가 포함된 풀버전(500MB+)을
+# 받는다. 이 서버엔 GPU가 없으니 CPU 전용 빌드(훨씬 작음)로 먼저 깔아두고,
+# 나머지 requirements.txt를 설치하면 pip이 torch/torchvision은 이미 설치된
+# 걸로 보고 건너뛴다.
+venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 venv/bin/pip install -r requirements.txt
 
 echo "== 설치 확인 =="
