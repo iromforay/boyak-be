@@ -94,7 +94,7 @@ class Medicine{
     public function once($code)
     {
 
-        $result =  $this->curl($this->get_product."item_seq=".$code."&",0,0);
+        $result =  $this->curl($this->get_product."item_seq=".$code."&",1,300);
         $this->down($result);
         exit;
     }
