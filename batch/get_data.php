@@ -163,11 +163,11 @@ class Medicine{
     {
         if(! is_object($result) || ! isset($result->body->items)) return $this;
 
-        $dir = __DIR__."\..\storage\data\\".date("Y-m-d");
+        $dir = __DIR__.DIRECTORY_SEPARATOR."..".DIRECTORY_SEPARATOR."storage".DIRECTORY_SEPARATOR."data".DIRECTORY_SEPARATOR.date("Y-m-d");
         if(! is_dir($dir)) mkdir($dir, 0777, true);
 
         $pageNo = isset($result->body->pageNo) ? $result->body->pageNo : 0;
-        $file = $dir."\\page_".sprintf("%03d",$pageNo).".json";
+        $file = $dir.DIRECTORY_SEPARATOR."page_".sprintf("%03d",$pageNo).".json";
         file_put_contents($file, json_encode($result->body->items, JSON_UNESCAPED_UNICODE));
         echo "저장 : ".$file."\n";
         return $this;
