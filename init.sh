@@ -7,7 +7,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "== 시스템 패키지 설치 (venv, tesseract-ocr, opencv 런타임 라이브러리) =="
-sudo apt-get update -y
+# 서버에 등록된 다른 PPA(예: PHP용)가 이 Ubuntu 버전을 아직 지원 안 해서
+# 404가 날 수 있다. 우리가 쓸 패키지는 전부 기본 저장소(main/security)에
+# 있으니, update 단계의 개별 저장소 실패는 무시하고 계속 진행한다.
+sudo apt-get update -y || true
 sudo apt-get install -y python3-venv python3-pip tesseract-ocr libgl1 libglib2.0-0
 
 echo "== venv 생성 =="
