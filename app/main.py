@@ -127,6 +127,7 @@ def _to_pills(results: list, w: int, h: int) -> list:
                 "shape_label": pill_service.get_shape_label(r["shape"]),
                 "color_label": pill_service.get_color_label(r["color"]),
                 "color_rgb": list(r["color_rgb"]),
+                "imprint": r.get("imprint", ""),
                 "points": points,
             }
         )
@@ -216,3 +217,12 @@ def drug_lookup(body: DrugLookupRequest):
         "drug_names": [d["item_name"] for d in drugs],
         "drugs": drugs,
     }
+
+
+@app.get("/drug_search")
+def drug_search(q: str):
+    """약 이름/제조사명으로 직접 검색 (사진 없이, 식약처 의약품 정보 테이블 조회)."""
+    q = q.strip()
+    if not q:
+        return {"drugs": []}
+    return {"drugs": pill_service.search_drugs(q)}

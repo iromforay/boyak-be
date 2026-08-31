@@ -20,9 +20,41 @@ _SEARCH_SQL = """
     LIMIT 50
 """
 
+_SEARCH_SQL_WITH_IMPRINT = """
+    SELECT item_seq, item_name, entp_name, chart, drug_shape, color_class1,
+           color_class2, print_front, print_back, class_name, etc_otc_name,
+           item_permit_date
+    FROM product
+    WHERE drug_shape = %s AND color_class1 = %s AND (print_front = %s OR print_back = %s)
+    ORDER BY item_name
+    LIMIT 50
+"""
+
+# OCR이 각인 일부만 읽었을 때(예: "V" - DB엔 "V분할선8") 완전일치가 실패하므로
+# 부분일치로 한 번 더 시도하는 용도.
+_SEARCH_SQL_WITH_IMPRINT_LIKE = """
+    SELECT item_seq, item_name, entp_name, chart, drug_shape, color_class1,
+           color_class2, print_front, print_back, class_name, etc_otc_name,
+           item_permit_date
+    FROM product
+    WHERE drug_shape = %s AND color_class1 = %s AND (print_front LIKE %s OR print_back LIKE %s)
+    ORDER BY item_name
+    LIMIT 50
+"""
+
+_SEARCH_BY_NAME_SQL = """
+    SELECT item_seq, item_name, entp_name, chart, drug_shape, color_class1,
+           color_class2, print_front, print_back, class_name, etc_otc_name,
+           item_permit_date
+    FROM product
+    WHERE item_name LIKE %s OR entp_name LIKE %s
+    ORDER BY item_name
+    LIMIT 50
+"""
+
 
 class PillModel:
-    def find_by_shape_color(self, shape: str, color: str) -> list[dict]:
+    def find_by_shape_color(self, shape: str, color: str, imprint: str | None = None, imprint_like: bool = False) -> list[dict]:
         try:
             conn = get_connection()
         except pymysql.MySQLError:
@@ -30,7 +62,27 @@ class PillModel:
 
         try:
             with conn.cursor() as cur:
-                cur.execute(_SEARCH_SQL, (shape, color))
+                if imprint and imprint_like:
+                    like = f"%{imprint}%"
+                    cur.execute(_SEARCH_SQL_WITH_IMPRINT_LIKE, (shape, color, like, like))
+                elif imprint:
+                    cur.execute(_SEARCH_SQL_WITH_IMPRINT, (shape, color, imprint, imprint))
+                else:
+                    cur.execute(_SEARCH_SQL, (shape, color))
+                return cur.fetchall()
+        finally:
+            conn.close()
+
+    def find_by_name(self, keyword: str) -> list[dict]:
+        try:
+            conn = get_connection()
+        except pymysql.MySQLError:
+            return []
+
+        try:
+            with conn.cursor() as cur:
+                like = f"%{keyword}%"
+                cur.execute(_SEARCH_BY_NAME_SQL, (like, like))
                 return cur.fetchall()
         finally:
             conn.close()

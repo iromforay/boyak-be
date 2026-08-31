@@ -4,6 +4,7 @@
 // storage/data/[Y-m-d]/page_*.json (run_collect가 저장해둔 페이지 단위 원본) 을 스캔해서
 // 아이템별로 캐시 체크 후 DB(product) 에 반영한다. 처리한 파일은 storage/data/done/[Y-m-d]/ 로 옮긴다.
 class StoreProcessor{
+    private $link;
     private $product;
     private $store_dir;
     private $done_dir;
@@ -18,6 +19,7 @@ class StoreProcessor{
     // DB 연결과 저장 경로(store_dir/done_dir/image_dir)를 초기화한다.
     public function __construct($link)
     {
+        $this->link = $link;
         $this->product = new Product($link);
         $this->store_dir = __DIR__.DIRECTORY_SEPARATOR."..".DIRECTORY_SEPARATOR."storage".DIRECTORY_SEPARATOR."data";
         $this->done_dir = $this->store_dir.DIRECTORY_SEPARATOR."done";
@@ -62,6 +64,191 @@ class StoreProcessor{
         }
 
         $this->move_done($file);
+    }
+
+    // run()과 같은 파일을 처리하지만, 아이템마다 쿼리를 날리는 대신 캐시를
+    // 한 번에 통째로 읽어와 메모리에서 비교하고, 변경분에 대한 SQL은 DB에
+    // 바로 실행하지 않고 storage/data/sql/{시각}.sql 로 파일만 남긴다.
+    // 실제 DB 반영은 run_exec_batch()가 별도로 담당한다 (parse_batch로 SQL만
+    // 만들어두고, exec_batch로 한번에 실행하는 2단계 구조).
+    public function run_batch()
+    {
+        $files = glob($this->store_dir.DIRECTORY_SEPARATOR."*".DIRECTORY_SEPARATOR."page_*.json");
+        echo "===================\n";
+        echo "대상 파일 수 : ".count($files)."\n";
+
+        $cache_map = $this->load_cache_map();
+        echo "캐시 로드 : ".count($cache_map)."건\n";
+
+        $rows = [];
+        $total = 0;
+
+        foreach($files as $file){
+            $json = file_get_contents($file);
+            $items = json_decode($json);
+            if(! is_array($items)){
+                echo "파싱 실패, 스킵 : ".$file."\n";
+                continue;
+            }
+
+            foreach($items as $item){
+                if(! isset($item->ITEM_SEQ)) continue;
+                $total++;
+                $row = $this->build_row_for_item($item, $cache_map);
+                if($row){
+                    $rows[] = $row;
+                }
+            }
+        }
+
+        echo "전체 ".$total."건 중 변경 ".count($rows)."건\n";
+
+        if($rows){
+            $sql_dir = $this->store_dir.DIRECTORY_SEPARATOR."sql";
+            if(! is_dir($sql_dir)) mkdir($sql_dir, 0777, true);
+            $sql_file = $sql_dir.DIRECTORY_SEPARATOR.date("Ymd_His").".sql";
+            $sql_text = $this->build_batch_sql($rows);
+            file_put_contents($sql_file, $sql_text);
+            echo "SQL 파일 저장 : ".$sql_file." (실행은 exec_batch에서)\n";
+        }else{
+            echo "변경 없음, 생성할 SQL 없음\n";
+        }
+
+        foreach($files as $file){
+            $this->move_done($file);
+        }
+    }
+
+    // run_batch()가 storage/data/sql/ 에 쌓아둔 .sql 파일들을 순서대로(파일명=시각
+    // 기준) 하나씩 multi_query로 실행한다. 실행 끝난 파일은 storage/data/sql/done/
+    // 으로 옮겨서 재실행해도 중복 실행되지 않는다.
+    public function run_exec_batch()
+    {
+        $sql_dir = $this->store_dir.DIRECTORY_SEPARATOR."sql";
+        $done_dir = $sql_dir.DIRECTORY_SEPARATOR."done";
+        if(! is_dir($done_dir)) mkdir($done_dir, 0777, true);
+
+        $files = glob($sql_dir.DIRECTORY_SEPARATOR."*.sql");
+        sort($files); // 파일명이 시각(Ymd_His)이라 정렬하면 생성 순서대로 실행됨
+        echo "===================\n";
+        echo "실행 대상 SQL 파일 수 : ".count($files)."\n";
+
+        foreach($files as $file){
+            echo "-------------------\n";
+            echo "실행 : ".$file."\n";
+            $sql_text = file_get_contents($file);
+            $this->run_sql_batch($sql_text);
+            rename($file, $done_dir.DIRECTORY_SEPARATOR.basename($file));
+        }
+    }
+
+    // cache 테이블 전체를 한 번에 읽어 [item_seq => hash] 배열로 돌려준다.
+    private function load_cache_map()
+    {
+        $map = [];
+        $result = $this->link->query("SELECT `key`, `val` FROM `cache`");
+        while($row = $result->fetch_assoc()){
+            $map[$row['key']] = $row['val'];
+        }
+        return $map;
+    }
+
+    // product 테이블 컬럼 순서. build_row_for_item()의 VALUES(...) 순서와
+    // build_batch_sql()의 INSERT INTO product(...) 순서가 반드시 일치해야 한다.
+    private const PRODUCT_COLUMNS = "item_seq,item_name,entp_seq,entp_name,chart,item_image,print_front,print_back,
+        drug_shape,color_class1,color_class2,line_front,line_back,leng_long,leng_short,thick,img_regist_ts,
+        class_no,class_name,etc_otc_name,item_permit_date,form_code_name,mark_code_front_anal,mark_code_back_anal,
+        mark_code_front_img,mark_code_back_img,item_eng_name,change_date,mark_code_front,mark_code_back,edi_code,reg_date";
+
+    // 아이템 1건을 캐시맵과 비교해서, 변경 없으면 null, 변경/신규면 이 아이템의
+    // cache VALUES(...) 조각과 product VALUES(...) 조각을 돌려준다 (개별
+    // INSERT 문이 아니라, 나중에 build_batch_sql()이 여러 건을 묶어서 하나의
+    // 멀티row INSERT로 만들 재료). $cache_map은 참조로 받아 같은 배치 안에서
+    // item_seq가 또 나와도 최신 해시 기준으로 비교되게 갱신해둔다.
+    private function build_row_for_item($item, &$cache_map)
+    {
+        $key = $item->ITEM_SEQ;
+        $json = json_encode($item, JSON_UNESCAPED_UNICODE);
+        $hash = md5($json);
+
+        if(isset($cache_map[$key]) && $cache_map[$key] === $hash){
+            return null;
+        }
+        $cache_map[$key] = $hash;
+
+        $shape_key = $this->product->shapeKeyFromLabel($item->DRUG_SHAPE);
+        $color_key = $this->product->colorKeyFromLabel($item->COLOR_CLASS1);
+
+        $cache_values = sprintf("('%s','%s',now())", $this->esc($key), $hash);
+
+        $product_values = sprintf(
+            "('%s','%s','%s','%s','%s','%s','%s','%s',
+            '%s','%s','%s','%s','%s',%f,%f,%f,'%s',
+            '%s','%s','%s','%s','%s','%s','%s',
+            '%s','%s','%s','%s','%s','%s','%s',now())",
+            $this->esc($item->ITEM_SEQ), $this->esc($item->ITEM_NAME), $this->esc($item->ENTP_SEQ), $this->esc($item->ENTP_NAME), $this->esc($item->CHART), $this->esc($item->ITEM_IMAGE), $this->esc($item->PRINT_FRONT), $this->esc($item->PRINT_BACK),
+            $shape_key, $color_key, $this->esc($item->COLOR_CLASS2), $this->esc($item->LINE_FRONT), $this->esc($item->LINE_BACK), (float)$item->LENG_LONG, (float)$item->LENG_SHORT, (float)$item->THICK, $this->esc($item->IMG_REGIST_TS),
+            $this->esc($item->CLASS_NO), $this->esc($item->CLASS_NAME), $this->esc($item->ETC_OTC_NAME), $this->esc($item->ITEM_PERMIT_DATE), $this->esc($item->FORM_CODE_NAME), $this->esc($item->MARK_CODE_FRONT_ANAL), $this->esc($item->MARK_CODE_BACK_ANAL),
+            $this->esc($item->MARK_CODE_FRONT_IMG), $this->esc($item->MARK_CODE_BACK_IMG), $this->esc($item->ITEM_ENG_NAME), $this->esc($item->CHANGE_DATE), $this->esc($item->MARK_CODE_FRONT), $this->esc($item->MARK_CODE_BACK), $this->esc($item->EDI_CODE)
+        );
+
+        return [
+            'key' => $key,
+            'cache_values' => $cache_values,
+            'product_values' => $product_values,
+        ];
+    }
+
+    // build_row_for_item()이 모은 row들을 멀티row INSERT 3~4문으로 묶는다.
+    // (개별 문장 N개 대신 "INSERT ... VALUES (...),(...),(...)" 묶음 문장으로
+    // 처리해야 MySQL이 훨씬 빠르다 - 파싱/인덱스 갱신이 문장당 1번씩만 든다.)
+    // max_allowed_packet 초과를 피하려고 CHUNK_SIZE개씩 끊어서 여러 배치로 나눈다.
+    private const CHUNK_SIZE = 500;
+
+    private function build_batch_sql($rows)
+    {
+        $sql = "START TRANSACTION;\n";
+
+        foreach(array_chunk($rows, self::CHUNK_SIZE) as $chunk){
+            $keys = array_map(fn($r) => "'".$this->esc($r['key'])."'", $chunk);
+            $cache_values = array_column($chunk, 'cache_values');
+            $product_values = array_column($chunk, 'product_values');
+
+            $sql .= "INSERT INTO `cache` (`key`,`val`,reg_date) VALUES\n"
+                . implode(",\n", $cache_values)
+                . "\nON DUPLICATE KEY UPDATE `val`=VALUES(`val`), up_date=now();\n";
+
+            $sql .= "DELETE FROM product WHERE item_seq IN (" . implode(",", $keys) . ");\n";
+
+            $sql .= "INSERT INTO product (" . self::PRODUCT_COLUMNS . ") VALUES\n"
+                . implode(",\n", $product_values)
+                . ";\n";
+        }
+
+        $sql .= "COMMIT;\n";
+        return $sql;
+    }
+
+    private function esc($v)
+    {
+        return addslashes((string)($v ?? ''));
+    }
+
+    // 모아둔 SQL 텍스트(세미콜론으로 구분된 여러 statement)를 한 번에 실행한다.
+    private function run_sql_batch($sql_text)
+    {
+        if($this->link->multi_query($sql_text)){
+            do{
+                if($result = $this->link->store_result()){
+                    $result->free();
+                }
+            }while($this->link->more_results() && $this->link->next_result());
+        }
+        if($this->link->errno){
+            echo "SQL 실행 오류 : ".$this->link->error."\n";
+        }else{
+            echo "SQL 실행 완료\n";
+        }
     }
 
     // 처리 완료된 파일을 storage/data/done/[Y-m-d]/ 로 이동한다.

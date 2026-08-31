@@ -17,8 +17,8 @@ if sys.stdout.encoding != "utf-8":
 
 
 def diagnose(image_path: str, save_overlay: bool = True) -> list:
-    """이미지를 진단해 알약별 {shape, color, color_rgb} 리스트를 반환한다."""
-    results = analyze(image_path, with_imprint=False)
+    """이미지를 진단해 알약별 {shape, color, color_rgb, imprint} 리스트를 반환한다."""
+    results = analyze(image_path, with_imprint=True)
 
     if save_overlay and results:
         overlay_path = str(Path(image_path).with_name(Path(image_path).stem + "_detected.png"))

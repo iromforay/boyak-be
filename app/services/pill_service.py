@@ -44,19 +44,27 @@ class PillService:
     def find_drugs(self, shape: str, color: str, imprint: str | None = None) -> list[dict]:
         """모양+색상(+각인)으로 후보 약을 조회해 화면에 바로 쓸 수 있는 형태로 돌려준다.
 
-        imprint가 있으면 모양+색상 후보 중 각인이 일치하는 것을 앞에 두고,
-        OCR 오차를 감안해 부분 일치도 인정한다. imprint로 하나도 안 맞으면
-        (OCR 실패 가능성이 있으니) 모양+색상 후보 전체를 그대로 돌려준다.
+        각인 매칭은 3단계로 좁혀간다: 완전일치 -> 부분일치(LIKE) -> (그래도
+        없으면) 각인 무시. OCR이 "V"만 읽었는데 DB엔 "V분할선8"로 저장된
+        경우처럼, 완전일치는 실패해도 부분일치로는 찾아지는 경우가 많다.
+        셋 다 실패하면 모양+색상 후보 전체를 그대로 보여준다.
         """
-        rows = self._model.find_by_shape_color(shape, color)
-        drugs = [self._to_drug(row) for row in rows]
-
         norm_imprint = self._normalize_imprint(imprint)
         if not norm_imprint:
-            return drugs
+            rows = self._model.find_by_shape_color(shape, color)
+            return [self._to_drug(row) for row in rows]
 
-        matched = [d for d in drugs if self._imprint_matches(norm_imprint, d)]
-        return matched if matched else drugs
+        rows = self._model.find_by_shape_color(shape, color, norm_imprint)
+        if not rows:
+            rows = self._model.find_by_shape_color(shape, color, norm_imprint, imprint_like=True)
+        if not rows:
+            rows = self._model.find_by_shape_color(shape, color)
+        return [self._to_drug(row) for row in rows]
+
+    def search_drugs(self, keyword: str) -> list[dict]:
+        """약 이름/제조사명으로 직접 검색 (사진 분석 없이 텍스트 검색)."""
+        rows = self._model.find_by_name(keyword)
+        return [self._to_drug(row) for row in rows]
 
     def _to_drug(self, row: dict) -> dict:
         item_seq = row["item_seq"]
@@ -80,19 +88,3 @@ class PillService:
         if not text:
             return ""
         return "".join(text.split()).upper()
-
-    @staticmethod
-    def _imprint_matches(norm_imprint: str, drug: dict) -> bool:
-        for code in (drug["print_front"], drug["print_back"]):
-            if not code:
-                continue
-            norm_code = "".join(code.split()).upper()
-            # 한 글자짜리 각인은 아무 텍스트에나 우연히 포함되기 쉬워
-            # (예: "Z" in "ZZZZZZ999") 오탐이 나므로 2자 이상만 비교한다.
-            if len(norm_code) < 2:
-                continue
-            # OCR이 각인 일부만 읽었거나(부분 일치), 반대로 앞/뒤 각인을
-            # 한 번에 다 읽어버린 경우(포함 관계) 둘 다 일치로 본다.
-            if norm_code in norm_imprint or norm_imprint in norm_code:
-                return True
-        return False

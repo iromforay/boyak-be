@@ -257,22 +257,72 @@ def detect_color(image: np.ndarray, mask: np.ndarray):
     return name, rgb
 
 
+_OCR_WHITELIST = "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def _binarize_for_ocr(gray: np.ndarray) -> np.ndarray:
+    """양각 각인 인식용 이진화.
+
+    그레이스케일+대비보정(CLAHE)만으로 OCR에 넣으면, 알약 표면의 미세
+    텍스처(그레인)가 글자로 오인되어 쓰레기값이 나온다(실측으로 확인됨).
+    업스케일 -> 중간값 블러(표면 미세노이즈 제거) -> 적응형 이진화 ->
+    모폴로지 open(이진화 후 남는 잔점 제거) 순서로 처리해야 실제 양각
+    획만 또렷하게 남는다.
+    """
+    scaled = cv2.resize(gray, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    blurred = cv2.medianBlur(scaled, 7)
+    binary = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 8
+    )
+    kernel = np.ones((3, 3), np.uint8)
+    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+
+def _ocr_text(binary: np.ndarray, psm: int) -> str:
+    config = f"--psm {psm} {_OCR_WHITELIST}"
+    return " ".join(pytesseract.image_to_string(binary, config=config).split())
+
+
 def extract_imprint(image: np.ndarray, contour) -> str:
+    """알약 표면의 양각 각인을 읽는다.
+
+    각인이 알약 중앙 분할선(스코어라인)을 사이에 두고 좌/우로 나뉜 경우
+    (예: "V 8")는 전체를 한 번에 읽으면 실패하기 쉬워서, 전체 크롭으로
+    먼저 시도하고 실패하면 좌/우 반쪽으로 나눠 한 글자씩 다시 시도한다.
+    """
     x, y, w, h = cv2.boundingRect(contour)
     pad = int(0.05 * max(w, h))
     x0, y0 = max(x - pad, 0), max(y - pad, 0)
     x1, y1 = min(x + w + pad, image.shape[1]), min(y + h + pad, image.shape[0])
     crop = image[y0:y1, x0:x1]
-
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    scaled = cv2.resize(enhanced, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
 
-    config = "--psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    text = pytesseract.image_to_string(scaled, config=config)
-    cleaned = " ".join(text.split())
-    return cleaned
+    whole = _binarize_for_ocr(gray)
+    # PSM 8/13(단일 단어/글자 가정)은 오탐이 적어 먼저 시도한다.
+    # PSM 11(성긴 텍스트)은 뭐라도 걸리면 반환해버려서 노이즈에 취약하므로
+    # 분할 시도까지 다 실패했을 때만 마지막 수단으로 쓴다.
+    for psm in (8, 13):
+        text = _ocr_text(whole, psm)
+        if text:
+            return text
+
+    gh, gw = gray.shape
+    margin = int(gw * 0.08)
+    mid = gw // 2
+    parts = []
+    for half in (gray[:, : mid - margin], gray[:, mid + margin :]):
+        if half.size == 0:
+            continue
+        binary = _binarize_for_ocr(half)
+        for psm in (8, 13):
+            text = _ocr_text(binary, psm)
+            if text:
+                parts.append(text)
+                break
+    if parts:
+        return " ".join(parts)
+
+    return _ocr_text(whole, 11)
 
 
 def analyze(image_path: str, with_imprint: bool = True) -> list:
