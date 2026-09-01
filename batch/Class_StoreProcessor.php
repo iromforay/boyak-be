@@ -97,7 +97,11 @@ class StoreProcessor{
                 $total++;
                 $row = $this->build_row_for_item($item, $cache_map);
                 if($row){
-                    $rows[] = $row;
+                    // item_seq를 키로 써서, 같은 배치 안에 같은 item_seq가 여러 번
+                    // (예: 오래된 미처리 파일이 오늘 파일과 섞여 다른 스냅샷으로
+                    // 잡히는 경우) 나와도 한 건만 남는다 - 안 그러면 한 멀티row
+                    // INSERT 안에 같은 유니크키가 두 번 들어가서 에러난다.
+                    $rows[$row['key']] = $row;
                     if(! empty($item->ITEM_IMAGE)){
                         $image_targets[$item->ITEM_SEQ] = $item->ITEM_IMAGE;
                     }
