@@ -81,6 +81,7 @@ class StoreProcessor{
         echo "캐시 로드 : ".count($cache_map)."건\n";
 
         $rows = [];
+        $image_targets = []; // 이번에 변경/신규로 확인된 아이템의 이미지 URL - image 단계가 재다운로드 대상으로 재사용
         $total = 0;
 
         foreach($files as $file){
@@ -97,6 +98,9 @@ class StoreProcessor{
                 $row = $this->build_row_for_item($item, $cache_map);
                 if($row){
                     $rows[] = $row;
+                    if(! empty($item->ITEM_IMAGE)){
+                        $image_targets[$item->ITEM_SEQ] = $item->ITEM_IMAGE;
+                    }
                 }
             }
         }
@@ -106,10 +110,18 @@ class StoreProcessor{
         if($rows){
             $sql_dir = $this->store_dir.DIRECTORY_SEPARATOR."sql";
             if(! is_dir($sql_dir)) mkdir($sql_dir, 0777, true);
-            $sql_file = $sql_dir.DIRECTORY_SEPARATOR.date("Ymd_His").".sql";
+            $timestamp = date("Ymd_His");
+
+            $sql_file = $sql_dir.DIRECTORY_SEPARATOR.$timestamp.".sql";
             $sql_text = $this->build_batch_sql($rows);
             file_put_contents($sql_file, $sql_text);
             echo "SQL 파일 저장 : ".$sql_file." (실행은 exec_batch에서)\n";
+
+            if($image_targets){
+                $images_file = $sql_dir.DIRECTORY_SEPARATOR.$timestamp.".images.json";
+                file_put_contents($images_file, json_encode($image_targets, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+                echo "변경된 이미지 목록 저장 : ".$images_file." (".count($image_targets)."건, image 단계에서 소비)\n";
+            }
         }else{
             echo "변경 없음, 생성할 SQL 없음\n";
         }
@@ -137,8 +149,16 @@ class StoreProcessor{
             echo "-------------------\n";
             echo "실행 : ".$file."\n";
             $sql_text = file_get_contents($file);
-            $this->run_sql_batch($sql_text);
-            rename($file, $done_dir.DIRECTORY_SEPARATOR.basename($file));
+            $ok = $this->run_sql_batch($sql_text);
+            if($ok){
+                rename($file, $done_dir.DIRECTORY_SEPARATOR.basename($file));
+            }else{
+                // 실패한 파일은 done으로 옮기지 않고 그대로 둔다 (원인 고친 뒤 재실행하면
+                // 다음 exec_batch 호출 때 다시 이 파일부터 시도된다). 이후 파일들도
+                // 순서가 꼬이면 안 되니 여기서 멈춘다.
+                echo "실패해서 done으로 안 옮김, 뒤 파일은 건너뛴다 : ".$file."\n";
+                break;
+            }
         }
     }
 
@@ -235,19 +255,52 @@ class StoreProcessor{
     }
 
     // 모아둔 SQL 텍스트(세미콜론으로 구분된 여러 statement)를 한 번에 실행한다.
+    // PHP 8.1+에서 mysqli는 기본적으로 에러 시 예외를 던진다 - 여러 statement
+    // 중 하나(예: 컬럼 길이 초과)가 실패하면 잡아서 롤백하고 false를 돌려준다.
+    // (이걸 안 잡으면 전체 PHP 프로세스가 죽어서, 이 파일 뒤에 든 아직
+    // 손도 안 댄 데이터까지 통째로 유실되는 걸 겪은 적이 있다.)
     private function run_sql_batch($sql_text)
     {
-        if($this->link->multi_query($sql_text)){
-            do{
+        try{
+            if($this->link->multi_query($sql_text)){
+                do{
+                    if($result = $this->link->store_result()){
+                        $result->free();
+                    }
+                }while($this->link->more_results() && $this->link->next_result());
+            }
+        }catch(\mysqli_sql_exception $e){
+            echo "SQL 실행 오류(예외) : ".$e->getMessage()."\n";
+            $this->drain_and_rollback();
+            return false;
+        }
+
+        if($this->link->errno){
+            echo "SQL 실행 오류 : ".$this->link->error."\n";
+            $this->drain_and_rollback();
+            return false;
+        }
+
+        echo "SQL 실행 완료\n";
+        return true;
+    }
+
+    // 실패 후 커넥션에 남아있을 수 있는 결과셋을 비우고(안 하면 다음 쿼리가
+    // "commands out of sync" 에러가 날 수 있음) 트랜잭션을 롤백한다.
+    private function drain_and_rollback()
+    {
+        try{
+            while($this->link->more_results() && @$this->link->next_result()){
                 if($result = $this->link->store_result()){
                     $result->free();
                 }
-            }while($this->link->more_results() && $this->link->next_result());
+            }
+        }catch(\mysqli_sql_exception $e){
+            // 결과셋 비우기 중 예외는 무시 - 롤백만 확실히 하면 된다.
         }
-        if($this->link->errno){
-            echo "SQL 실행 오류 : ".$this->link->error."\n";
-        }else{
-            echo "SQL 실행 완료\n";
+        try{
+            $this->link->query("ROLLBACK");
+        }catch(\mysqli_sql_exception $e){
         }
     }
 
