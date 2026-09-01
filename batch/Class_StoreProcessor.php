@@ -319,15 +319,58 @@ class StoreProcessor{
         echo "처리 완료, 이동 : ".$target_dir.DIRECTORY_SEPARATOR.basename($file)."\n";
     }
 
-    // 파싱 전/후 json 파일을 모두 읽어 (item_seq, image_url) 목록을 모은 뒤 download_images()에 넘긴다.
+    // 매일 전체를 다 재다운로드하지 않도록, 대상을 두 갈래로만 좁힌다:
+    //   1) 변경분 - parse_batch가 "오늘 데이터 바뀐 아이템"으로 이미 판단해서
+    //      storage/data/sql/*.images.json 에 남겨둔 목록 (무조건 다시 받음)
+    //   2) 누락분 - 전체 json을 훑어보되, 로컬에 파일이 아직 없는 것만 (예전
+    //      실패분 백필). 이미 파일이 있으면 데이터가 안 바뀌었다는 뜻이므로 건너뜀.
     public function run_image()
+    {
+        $changed = $this->load_changed_image_targets();
+        $missing = $this->load_missing_image_targets();
+        $targets = $changed + $missing; // 키(item_seq) 겹치면 changed 값이 우선 유지됨
+
+        echo "===================\n";
+        echo "이미지 대상 : 변경분 ".count($changed)."건 + 누락분 ".count($missing)."건 = 총 ".count($targets)."건\n";
+        $this->download_images($targets);
+    }
+
+    // run_batch()가 남겨둔 storage/data/sql/*.images.json (아직 소비 안 된 것들)을
+    // 전부 읽어 [item_seq => image_url]로 합친다. 다 읽은 파일은 sql/images_done/
+    // 으로 옮겨서 다음 실행 때 또 안 읽히게 한다.
+    private function load_changed_image_targets()
+    {
+        $sql_dir = $this->store_dir.DIRECTORY_SEPARATOR."sql";
+        $sql_done_dir = $sql_dir.DIRECTORY_SEPARATOR."done";
+        $images_done_dir = $sql_dir.DIRECTORY_SEPARATOR."images_done";
+        if(! is_dir($images_done_dir)) mkdir($images_done_dir, 0777, true);
+
+        $files = array_merge(
+            glob($sql_dir.DIRECTORY_SEPARATOR."*.images.json"),
+            glob($sql_done_dir.DIRECTORY_SEPARATOR."*.images.json")
+        );
+        sort($files); // 시각순 - 나중 파일이 같은 item_seq를 덮어쓰게
+
+        $targets = [];
+        foreach($files as $file){
+            $map = json_decode(file_get_contents($file), true);
+            if(is_array($map)){
+                foreach($map as $seq => $url){
+                    $targets[$seq] = $url;
+                }
+            }
+            rename($file, $images_done_dir.DIRECTORY_SEPARATOR.basename($file));
+        }
+        return $targets;
+    }
+
+    // 파싱 전/후 json을 전부 훑어서, 로컬에 이미지 파일이 없는 item_seq만 골라낸다.
+    private function load_missing_image_targets()
     {
         $files = array_merge(
             glob($this->store_dir.DIRECTORY_SEPARATOR."*".DIRECTORY_SEPARATOR."page_*.json"),
             glob($this->done_dir.DIRECTORY_SEPARATOR."*".DIRECTORY_SEPARATOR."page_*.json")
         );
-        echo "===================\n";
-        echo "이미지 대상 파일 수 : ".count($files)."\n";
 
         $targets = [];
         foreach($files as $file){
@@ -337,12 +380,13 @@ class StoreProcessor{
 
             foreach($items as $item){
                 if(! isset($item->ITEM_SEQ) || empty($item->ITEM_IMAGE)) continue;
-                $targets[$item->ITEM_SEQ] = $item->ITEM_IMAGE; // item_seq 중복은 마지막 것으로 자연 정리됨
+                $path = $this->image_dir.DIRECTORY_SEPARATOR.$item->ITEM_SEQ.".jpg";
+                if(! is_file($path)){
+                    $targets[$item->ITEM_SEQ] = $item->ITEM_IMAGE;
+                }
             }
         }
-
-        echo "이미지 대상 건수 : ".count($targets)."\n";
-        $this->download_images($targets);
+        return $targets;
     }
 
     // (item_seq => image_url) 목록을 curl_multi_exec로 동시에(concurrency 개씩) 다운로드한다.
