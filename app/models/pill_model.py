@@ -10,12 +10,14 @@ import pymysql
 
 from app.db import get_connection
 
+# color_class1/color_class2 어느 쪽이든 일치하면 찾는다 - 이색(투톤) 알약은
+# 사용자가 두 색 중 하나만 알아도(또는 하나만 인식돼도) 찾을 수 있어야 한다.
 _SEARCH_SQL = """
     SELECT item_seq, item_name, entp_name, chart, drug_shape, color_class1,
            color_class2, print_front, print_back, class_name, etc_otc_name,
            item_permit_date
     FROM product
-    WHERE drug_shape = %s AND color_class1 = %s
+    WHERE drug_shape = %s AND (color_class1 = %s OR color_class2 = %s)
     ORDER BY item_name
     LIMIT 50
 """
@@ -25,7 +27,7 @@ _SEARCH_SQL_WITH_IMPRINT = """
            color_class2, print_front, print_back, class_name, etc_otc_name,
            item_permit_date
     FROM product
-    WHERE drug_shape = %s AND color_class1 = %s AND (print_front = %s OR print_back = %s)
+    WHERE drug_shape = %s AND (color_class1 = %s OR color_class2 = %s) AND (print_front = %s OR print_back = %s)
     ORDER BY item_name
     LIMIT 50
 """
@@ -37,7 +39,7 @@ _SEARCH_SQL_WITH_IMPRINT_LIKE = """
            color_class2, print_front, print_back, class_name, etc_otc_name,
            item_permit_date
     FROM product
-    WHERE drug_shape = %s AND color_class1 = %s AND (print_front LIKE %s OR print_back LIKE %s)
+    WHERE drug_shape = %s AND (color_class1 = %s OR color_class2 = %s) AND (print_front LIKE %s OR print_back LIKE %s)
     ORDER BY item_name
     LIMIT 50
 """
@@ -64,11 +66,11 @@ class PillModel:
             with conn.cursor() as cur:
                 if imprint and imprint_like:
                     like = f"%{imprint}%"
-                    cur.execute(_SEARCH_SQL_WITH_IMPRINT_LIKE, (shape, color, like, like))
+                    cur.execute(_SEARCH_SQL_WITH_IMPRINT_LIKE, (shape, color, color, like, like))
                 elif imprint:
-                    cur.execute(_SEARCH_SQL_WITH_IMPRINT, (shape, color, imprint, imprint))
+                    cur.execute(_SEARCH_SQL_WITH_IMPRINT, (shape, color, color, imprint, imprint))
                 else:
-                    cur.execute(_SEARCH_SQL, (shape, color))
+                    cur.execute(_SEARCH_SQL, (shape, color, color))
                 return cur.fetchall()
         finally:
             conn.close()

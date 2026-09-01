@@ -13,6 +13,10 @@ _SHAPE_LABELS = {
     "diamond": "마름모형",
     "pentagon": "오각형",
     "hexagon": "육각형",
+    "semicircle": "반원형",
+    "oblong": "장방형",
+    "octagon": "팔각형",
+    "other": "기타",
 }
 
 _COLOR_LABELS = {
@@ -28,6 +32,7 @@ _COLOR_LABELS = {
     "green": "초록",
     "gray": "회색",
     "black": "검정",
+    "clear": "투명",
 }
 
 

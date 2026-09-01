@@ -101,9 +101,16 @@ class Product {
     public function upsert_product($data)
     {
         $shape_key = $this->shapeKeyFromLabel($data->DRUG_SHAPE);
-        $color_key = $this->colorKeyFromLabel($data->COLOR_CLASS1);
+
+        $color1_raw = trim((string)$data->COLOR_CLASS1);
+        $color2_raw = isset($data->COLOR_CLASS2) ? trim((string)$data->COLOR_CLASS2) : '';
+        [$color1_key, $color2_key] = $this->colorKeysFromBoth($color1_raw, $color2_raw);
+        // color_class2가 없으면(단일색) '' 대신 진짜 SQL NULL을 넣어야 하므로,
+        // 이 자리만 따옴표 없는 원시 SQL 조각으로 끼워넣는다.
+        $color2_sql = $color2_key === null ? 'NULL' : "'" . $this->esc($color2_key) . "'";
+
         $query = "INSERT INTO product SET item_seq='%s',item_name='%s',entp_seq='%s',entp_name='%s',chart='%s',item_image='%s',print_front='%s',print_back='%s',
-        drug_shape='%s',color_class1='%s',color_class2='%s',
+        drug_shape='%s',color_class1='%s',color_class2=%s,
         line_front='%s',line_back='%s',leng_long=%f,leng_short=%f,thick=%f,img_regist_ts='%s',class_no='%s',class_name='%s',
         etc_otc_name='%s',item_permit_date='%s',form_code_name='%s',mark_code_front_anal='%s',mark_code_back_anal='%s',mark_code_front_img='%s',mark_code_back_img='%s',
         item_eng_name='%s',change_date='%s',mark_code_front='%s',mark_code_back='%s',edi_code='%s',reg_date=now()
@@ -117,7 +124,7 @@ class Product {
         item_eng_name=VALUES(item_eng_name),change_date=VALUES(change_date),mark_code_front=VALUES(mark_code_front),mark_code_back=VALUES(mark_code_back),
         edi_code=VALUES(edi_code),up_date=now()";
         $sql = sprintf($query,$data->ITEM_SEQ,$this->esc($data->ITEM_NAME),$this->esc($data->ENTP_SEQ),$this->esc($data->ENTP_NAME),$this->esc($data->CHART),$this->esc($data->ITEM_IMAGE),$this->esc($data->PRINT_FRONT),$this->esc($data->PRINT_BACK),
-            $shape_key,$color_key,$this->esc($data->COLOR_CLASS2),
+            $shape_key,$this->esc($color1_key),$color2_sql,
             $this->esc($data->LINE_FRONT),$this->esc($data->LINE_BACK),(float)$data->LENG_LONG,(float)$data->LENG_SHORT,(float)$data->THICK,$this->esc($data->IMG_REGIST_TS),$this->esc($data->CLASS_NO),$this->esc($data->CLASS_NAME),
             $this->esc($data->ETC_OTC_NAME),$this->esc($data->ITEM_PERMIT_DATE),$this->esc($data->FORM_CODE_NAME),$this->esc($data->MARK_CODE_FRONT_ANAL),$this->esc($data->MARK_CODE_BACK_ANAL),$this->esc($data->MARK_CODE_FRONT_IMG),$this->esc($data->MARK_CODE_BACK_IMG),
             $this->esc($data->ITEM_ENG_NAME),$this->esc($data->CHANGE_DATE),$this->esc($data->MARK_CODE_FRONT),$this->esc($data->MARK_CODE_BACK),$this->esc($data->EDI_CODE));
@@ -145,27 +152,85 @@ class Product {
         $_shape_key['마름모형'] = 'diamond';
         $_shape_key['오각형'] = 'pentagon';
         $_shape_key['육각형'] = 'hexagon';
+        $_shape_key['반원형'] = 'semicircle';
+        $_shape_key['장방형'] = 'oblong';
+        $_shape_key['팔각형'] = 'octagon';
+        $_shape_key['기타'] = 'other';
         return isset($_shape_key[$label]) ? $_shape_key[$label] : $label;
     }
-    public function colorKeyFromLabel($label)
+    // 단일 색상명(콤마 없는 원자값) 하나를 영문 키로 바꾼다. 모르는 값이면
+    // 원본을 그대로 돌려준다 (기존 동작 유지).
+    private function _colorBaseMap()
     {
-        $_color_key['흰색'] = 'white';
-        $_color_key['하양'] = 'white';
-        $_color_key['아이보리'] = 'ivory';
-        $_color_key['노랑'] = 'yellow';
-        $_color_key['주황'] = 'orange';
-        $_color_key['분홍'] = 'pink';
-        $_color_key['빨강'] = 'red';
-        $_color_key['갈색'] = 'brown';
-        $_color_key['보라'] = 'purple';
-        $_color_key['자주'] = 'purple';
-        $_color_key['파랑'] = 'blue';
-        $_color_key['남색'] = 'blue';
-        $_color_key['초록'] = 'green';
-        $_color_key['연두'] = 'green';
-        $_color_key['청록'] = 'green';
-        $_color_key['회색'] = 'gray';
-        $_color_key['검정'] = 'black';
-        return isset($_color_key[$label]) ? $_color_key[$label] : $label;
+        $m = [];
+        $m['흰색'] = 'white';
+        $m['하양'] = 'white';
+        $m['아이보리'] = 'ivory';
+        $m['노랑'] = 'yellow';
+        $m['주황'] = 'orange';
+        $m['분홍'] = 'pink';
+        $m['빨강'] = 'red';
+        $m['갈색'] = 'brown';
+        $m['보라'] = 'purple';
+        $m['자주'] = 'purple';
+        $m['파랑'] = 'blue';
+        $m['남색'] = 'blue';
+        $m['초록'] = 'green';
+        $m['연두'] = 'green';
+        $m['청록'] = 'green';
+        $m['회색'] = 'gray';
+        $m['검정'] = 'black';
+        $m['투명'] = 'clear';
+        return $m;
+    }
+
+    // 라벨 하나(콤마로 여러 토큰이 뭉쳐있을 수 있음)를 실제 색상 키 배열로
+    // 바꾼다. "진한/옅은/투명"은 그 자체로는 색이 아니라 재질/명도 수식어라
+    // 항상 걸러진다 - "투명"이 단독으로 와도 여기서는 걸러지고, 진짜
+    // 무색 알약인지는 colorKeysFromBoth()가 두 필드를 다 걸러낸 뒤에
+    // 별도로 판단한다. "갈색, 진한"은 사진으로 확인된 특수 케이스라
+    // 예외적으로 black 하나로 취급한다(실제로는 진한 갈색이 우리 팔레트
+    // 기준 검정에 가까움).
+    private function _colorTokens($label)
+    {
+        if($label === '') return [];
+
+        $exact = ['갈색, 진한' => ['black']];
+        if(isset($exact[$label])) return $exact[$label];
+
+        $map = $this->_colorBaseMap();
+        $modifiers = ['진한', '옅은', '투명'];
+        $tokens = strpos($label, ',') !== false ? array_map('trim', explode(',', $label)) : [$label];
+        $colors = [];
+        foreach($tokens as $t){
+            if($t === '' || in_array($t, $modifiers, true)) continue;
+            $colors[] = isset($map[$t]) ? $map[$t] : $t;
+        }
+        return $colors;
+    }
+
+    // COLOR_CLASS1/COLOR_CLASS2 둘 다에서 실제 색상 토큰을 뽑아 합집합을
+    // 만든 뒤 [주색상, 보조색상|null]로 돌려준다. COLOR_CLASS2를 있는 그대로
+    // 믿지 않는 이유: 실측 확인 결과 COLOR_CLASS2가 COLOR_CLASS1의 토큰을
+    // (첫번째든 두번째든 일관성 없이) 그대로 반복하는 경우가 흔해서, 둘 다
+    // 똑같이 토큰 분해 후 합쳐야 안전하다. 이러면 어느 쪽을 반복하든 결과가
+    // 같고, 진짜 다른 색을 주는 경우(예: "주황,투명"+"노랑,투명")에도 둘 다
+    // 반영된다.
+    public function colorKeysFromBoth($color1_label, $color2_label)
+    {
+        $colors = array_values(array_unique(array_merge(
+            $this->_colorTokens($color1_label),
+            $this->_colorTokens($color2_label)
+        )));
+
+        if(count($colors) >= 2) return [$colors[0], $colors[1]];
+        if(count($colors) == 1) return [$colors[0], null];
+        // 아무 토큰도 못 뽑았으면(둘 다 비어있거나 수식어뿐이면) - 그 중
+        // 하나라도 "투명" 단독값이면 진짜 무색 알약이므로 clear로 취급한다.
+        // (예: "빨강, 투명"+"투명"은 재질 수식어 반복일 뿐이라 위에서 이미
+        // "red"로 처리됐고, 여기로 오는 건 순수 "투명"+""나 "투명"+"투명"뿐.)
+        if($color1_label === '투명' || $color2_label === '투명') return ['clear', null];
+        // 그 외엔 원본 COLOR_CLASS1을 그대로 둔다 - 기존 폴백 동작과 동일.
+        return [$color1_label, null];
     }
 }

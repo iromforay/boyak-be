@@ -201,17 +201,22 @@ class StoreProcessor{
         $cache_map[$key] = $hash;
 
         $shape_key = $this->product->shapeKeyFromLabel($item->DRUG_SHAPE);
-        $color_key = $this->product->colorKeyFromLabel($item->COLOR_CLASS1);
+        $color1_raw = trim((string)$item->COLOR_CLASS1);
+        $color2_raw = isset($item->COLOR_CLASS2) ? trim((string)$item->COLOR_CLASS2) : '';
+        [$color1_key, $color2_key] = $this->product->colorKeysFromBoth($color1_raw, $color2_raw);
+        // color_class2가 없으면(단일색) '' 대신 진짜 SQL NULL을 넣어야 하므로,
+        // 이 자리만 따옴표 없는 원시 SQL 조각으로 끼워넣는다.
+        $color2_sql = $color2_key === null ? 'NULL' : "'" . $this->esc($color2_key) . "'";
 
         $cache_values = sprintf("('%s','%s',now())", $this->esc($key), $hash);
 
         $product_values = sprintf(
             "('%s','%s','%s','%s','%s','%s','%s','%s',
-            '%s','%s','%s','%s','%s',%f,%f,%f,'%s',
+            '%s','%s',%s,'%s','%s',%f,%f,%f,'%s',
             '%s','%s','%s','%s','%s','%s','%s',
             '%s','%s','%s','%s','%s','%s','%s',now())",
             $this->esc($item->ITEM_SEQ), $this->esc($item->ITEM_NAME), $this->esc($item->ENTP_SEQ), $this->esc($item->ENTP_NAME), $this->esc($item->CHART), $this->esc($item->ITEM_IMAGE), $this->esc($item->PRINT_FRONT), $this->esc($item->PRINT_BACK),
-            $shape_key, $color_key, $this->esc($item->COLOR_CLASS2), $this->esc($item->LINE_FRONT), $this->esc($item->LINE_BACK), (float)$item->LENG_LONG, (float)$item->LENG_SHORT, (float)$item->THICK, $this->esc($item->IMG_REGIST_TS),
+            $shape_key, $this->esc($color1_key), $color2_sql, $this->esc($item->LINE_FRONT), $this->esc($item->LINE_BACK), (float)$item->LENG_LONG, (float)$item->LENG_SHORT, (float)$item->THICK, $this->esc($item->IMG_REGIST_TS),
             $this->esc($item->CLASS_NO), $this->esc($item->CLASS_NAME), $this->esc($item->ETC_OTC_NAME), $this->esc($item->ITEM_PERMIT_DATE), $this->esc($item->FORM_CODE_NAME), $this->esc($item->MARK_CODE_FRONT_ANAL), $this->esc($item->MARK_CODE_BACK_ANAL),
             $this->esc($item->MARK_CODE_FRONT_IMG), $this->esc($item->MARK_CODE_BACK_IMG), $this->esc($item->ITEM_ENG_NAME), $this->esc($item->CHANGE_DATE), $this->esc($item->MARK_CODE_FRONT), $this->esc($item->MARK_CODE_BACK), $this->esc($item->EDI_CODE)
         );

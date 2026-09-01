@@ -12,19 +12,12 @@
 
 import io
 import sys
-from pathlib import Path
 
 import cv2
 import numpy as np
-import pytesseract
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-
-# Windows에 기본 설치되는 경로. 다르게 설치했다면 이 값을 수정한다.
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-if Path(TESSERACT_CMD).exists():
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 NAMED_COLORS = {
     "white": (255, 255, 255),
@@ -172,11 +165,43 @@ def _ideal_ellipse_circularity(aspect_ratio: float) -> float:
     return 4 * np.pi * area / (perimeter**2)
 
 
+def _quad_is_rectangular(approx) -> bool:
+    """approxPolyDP로 나온 4개 꼭짓점의 내각이 전부 90도 근처인지 본다.
+
+    사각형/장방형은 내각이 90도에 가깝고, 마름모는 마주보는 꼭짓점 쌍의
+    내각이 90도에서 크게 벗어난다(하나는 예각, 하나는 둔각) - 종횡비만으로는
+    이 둘을 구분할 수 없어서 각도를 직접 봐야 한다.
+    """
+    pts = approx.reshape(-1, 2).astype(np.float64)
+    if len(pts) != 4:
+        return True
+    for i in range(4):
+        a, b, c = pts[i - 1], pts[i], pts[(i + 1) % 4]
+        v1, v2 = a - b, c - b
+        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+        angle = np.degrees(np.arccos(np.clip(cos_angle, -1, 1)))
+        if not (65 <= angle <= 115):
+            return False
+    return True
+
+
 def classify_shape(contour) -> str:
+    """알약 윤곽을 정해진 모양 어휘(식약처 API의 DRUG_SHAPE 값과 1:1로
+    맞춘 것) 중 하나로 분류한다. 어느 것에도 뚜렷이 들어맞지 않으면
+    "other"(기타)로 분류한다 - 억지로 아무 모양이나 갖다 붙이지 않는다.
+
+    알려진 한계: 육각형/팔각형/오각형/반원형은 원과 원형도가 비슷해서
+    (변이 많을수록 원에 가까워짐) 아래 원/타원 판정에 먼저 걸려 원/타원으로
+    분류될 수 있다. "변 길이가 고른 다각형만 예외 처리" 방식을 시도했으나,
+    실제 원형 알약 사진에서 세그멘테이션 잡음을 진짜 다각형으로 오판하는
+    회귀가 확인되어 되돌렸다 - 원/타원이 전체의 67%로 가장 흔한 케이스라
+    이 회귀 위험을 감수할 수 없었다. 실사진 검증 데이터가 쌓이기 전까지는
+    이 한계를 그대로 둔다 (전체 대비 이 4개 모양은 약 1.4%).
+    """
     area = cv2.contourArea(contour)
     raw_perimeter = cv2.arcLength(contour, True)
     if raw_perimeter == 0:
-        return "unknown"
+        return "other"
 
     rect = cv2.minAreaRect(contour)
     (_, _), (w, h), _ = rect
@@ -207,12 +232,18 @@ def classify_shape(contour) -> str:
     if vertices == 3:
         return "triangle"
     if vertices == 4:
-        return "diamond" if aspect_ratio > 1.15 else "square"
+        if _quad_is_rectangular(approx):
+            return "oblong" if aspect_ratio > 1.15 else "square"
+        return "diamond"
     if vertices == 5:
         return "pentagon"
-    if vertices >= 6:
+    if vertices == 6:
         return "hexagon"
-    return "oval" if aspect_ratio >= 1.15 else "round"
+    if vertices == 8:
+        return "octagon"
+    # 7각형 등 애매하게 남는 다각형이나 근사가 잘 안 되는 경우는 억지로
+    # 육각/팔각에 끼워 맞추지 않고 기타로 둔다.
+    return "other"
 
 
 def _closest_named_color(bgr):
@@ -257,38 +288,83 @@ def detect_color(image: np.ndarray, mask: np.ndarray):
     return name, rgb
 
 
-_OCR_WHITELIST = "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+_OCR_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+# 이 밑이면 오탐 가능성이 높다고 보고 버린다. 실측: 맞는 경우는 94~99%대가
+# 흔하지만, "8"을 "0"으로 틀리면서 93%대를 찍는 경우도 확인됨 - 신뢰도만
+# 으로는 이런 케이스를 완전히 못 거른다. 표본이 적어 임계값을 더 올려서
+# 맞추려 하기보다(과최적화 위험), 명백히 낮은 신뢰도만 걸러내는 선으로
+# 둔다. 어차피 틀린 값이 섞여도 DB 매칭은 LIKE 실패 -> 폭넓은 후보로
+# 완만하게 떨어질 뿐, 엉뚱한 약으로 잘못 특정되진 않는다.
+_OCR_CONFIDENCE_THRESHOLD = 0.7
+
+_OCR_READER = None
 
 
-def _binarize_for_ocr(gray: np.ndarray) -> np.ndarray:
-    """양각 각인 인식용 이진화.
+def _get_ocr_reader():
+    global _OCR_READER
+    if _OCR_READER is None:
+        import easyocr
 
-    그레이스케일+대비보정(CLAHE)만으로 OCR에 넣으면, 알약 표면의 미세
-    텍스처(그레인)가 글자로 오인되어 쓰레기값이 나온다(실측으로 확인됨).
-    업스케일 -> 중간값 블러(표면 미세노이즈 제거) -> 적응형 이진화 ->
-    모폴로지 open(이진화 후 남는 잔점 제거) 순서로 처리해야 실제 양각
-    획만 또렷하게 남는다.
+        _OCR_READER = easyocr.Reader(["en"], gpu=False, verbose=False)
+    return _OCR_READER
+
+
+def _detect_divider_x(gray: np.ndarray):
+    """알약 중앙을 가로지르는 분할선(스코어라인)의 x좌표를 찾는다. 없으면 None.
+
+    분할선은 알약 지름의 상당 부분을 가로지르는 거의 수직인 직선이라
+    Hough 직선 검출로 잘 잡힌다 (실측: 분할선 있는 알약은 검출됨, 없는
+    알약은 0개 - 오검출이 거의 없다).
     """
-    scaled = cv2.resize(gray, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-    blurred = cv2.medianBlur(scaled, 7)
-    binary = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 8
+    h, _ = gray.shape
+    edges = cv2.Canny(gray, 30, 90)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180, threshold=60, minLineLength=int(h * 0.5), maxLineGap=10
     )
-    kernel = np.ones((3, 3), np.uint8)
-    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    if lines is None:
+        return None
+
+    xs = []
+    for x1, y1, x2, y2 in lines:
+        angle = abs(np.degrees(np.arctan2(int(y2) - int(y1), int(x2) - int(x1))))
+        if 80 <= angle <= 100:  # 거의 수직인 것만 분할선 후보로 본다
+            xs.append((int(x1) + int(x2)) / 2)
+    if not xs:
+        return None
+    return int(np.median(xs))
 
 
-def _ocr_text(binary: np.ndarray, psm: int) -> str:
-    config = f"--psm {psm} {_OCR_WHITELIST}"
-    return " ".join(pytesseract.image_to_string(binary, config=config).split())
+def _ocr_one_side(region: np.ndarray) -> str:
+    """이미 분할선 기준으로 잘라둔 한쪽(글자 하나짜리로 가정)을 읽는다.
+    이미 위치를 알고 있으니 텍스트 탐지 단계는 건너뛰고(recognize) 바로
+    인식만 한다 - readtext보다 이 경우 더 정확하다(실측 확인)."""
+    if region.size == 0:
+        return ""
+    reader = _get_ocr_reader()
+    results = reader.recognize(region, allowlist=_OCR_ALLOWLIST)
+    if not results:
+        return ""
+    _, text, conf = results[0]
+    return text if text and conf >= _OCR_CONFIDENCE_THRESHOLD else ""
 
 
-def extract_imprint(image: np.ndarray, contour) -> str:
-    """알약 표면의 양각 각인을 읽는다.
+def extract_imprint(image: np.ndarray, contour) -> list[str]:
+    """알약 표면의 양각 각인을 읽어, 우선순위 순서의 후보 리스트를 돌려준다:
+    [합친 것(왼쪽+분할선+오른쪽), 왼쪽만, 오른쪽만] - 앞의 것일수록 정보량이
+    많지만(둘 다 맞아야 함) 그만큼 하나라도 틀리면 전체가 어긋난다. 한쪽만
+    맞춘 후보는 정보는 적어도 더 신뢰할 수 있다. 실제 DB 매칭(추후 작업)이
+    앞에서부터 순서대로 시도해보도록 이 순서를 그대로 유지해야 한다.
 
-    각인이 알약 중앙 분할선(스코어라인)을 사이에 두고 좌/우로 나뉜 경우
-    (예: "V 8")는 전체를 한 번에 읽으면 실패하기 쉬워서, 전체 크롭으로
-    먼저 시도하고 실패하면 좌/우 반쪽으로 나눠 한 글자씩 다시 시도한다.
+    분할선(스코어라인)이 없으면 통짜로 읽는다(단일 후보 또는 빈 리스트).
+    있으면 좌/우로 나눠서 각각 읽는다 - 각인이 분할선을 사이에 두고 나뉜
+    경우(예: "V 8")가 흔하고 통짜로 읽으면 실패하기 쉽다. 결과는 DB
+    (product.print_front/print_back)에 실제 저장된 형식과 맞춰 "분할선"
+    토큰을 그대로 끼워 넣는다 - 그래야 LIKE 매칭으로 DB의 "V분할선8"과
+    바로 맞아떨어진다. 실측 확인: 모양+색상으로 좁힌 후보 중에서도 "분할선
+    있음 + 한쪽 글자 하나"만 맞아도 후보가 수십 건 수준으로 좁혀진다 -
+    양쪽 다 정확히 읽을 필요는 없다. 읽은 게 하나도 없으면(신뢰도 낮음
+    포함) 빈 리스트를 돌려준다 - 틀린 값을 억지로 채우는 것보다 모르면
+    모른다고 하는 게 낫다.
     """
     x, y, w, h = cv2.boundingRect(contour)
     pad = int(0.05 * max(w, h))
@@ -296,33 +372,30 @@ def extract_imprint(image: np.ndarray, contour) -> str:
     x1, y1 = min(x + w + pad, image.shape[1]), min(y + h + pad, image.shape[0])
     crop = image[y0:y1, x0:x1]
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-
-    whole = _binarize_for_ocr(gray)
-    # PSM 8/13(단일 단어/글자 가정)은 오탐이 적어 먼저 시도한다.
-    # PSM 11(성긴 텍스트)은 뭐라도 걸리면 반환해버려서 노이즈에 취약하므로
-    # 분할 시도까지 다 실패했을 때만 마지막 수단으로 쓴다.
-    for psm in (8, 13):
-        text = _ocr_text(whole, psm)
-        if text:
-            return text
-
     gh, gw = gray.shape
-    margin = int(gw * 0.08)
-    mid = gw // 2
-    parts = []
-    for half in (gray[:, : mid - margin], gray[:, mid + margin :]):
-        if half.size == 0:
-            continue
-        binary = _binarize_for_ocr(half)
-        for psm in (8, 13):
-            text = _ocr_text(binary, psm)
-            if text:
-                parts.append(text)
-                break
-    if parts:
-        return " ".join(parts)
 
-    return _ocr_text(whole, 11)
+    divider_x = _detect_divider_x(gray)
+
+    if divider_x is None:
+        reader = _get_ocr_reader()
+        found = reader.readtext(gray, allowlist=_OCR_ALLOWLIST)
+        best = max(found, key=lambda r: r[2], default=None)
+        if best and best[1] and best[2] >= _OCR_CONFIDENCE_THRESHOLD:
+            return [best[1]]
+        return []
+
+    margin = int(gw * 0.06)
+    left_text = _ocr_one_side(gray[:, : max(divider_x - margin, 0)])
+    right_text = _ocr_one_side(gray[:, min(divider_x + margin, gw) :])
+
+    candidates = []
+    if left_text and right_text:
+        candidates.append(f"{left_text}분할선{right_text}")
+    if left_text:
+        candidates.append(f"{left_text}분할선")
+    if right_text:
+        candidates.append(f"분할선{right_text}")
+    return candidates
 
 
 def analyze(image_path: str, with_imprint: bool = True) -> list:
@@ -337,8 +410,11 @@ def analyze(image_path: str, with_imprint: bool = True) -> list:
         color_name, color_rgb = detect_color(image, mask)
         entry = {"shape": shape, "color": color_name, "color_rgb": color_rgb, "contour": contour}
         if with_imprint:
-            imprint = extract_imprint(image, contour)
-            entry["imprint"] = imprint or "(인식 실패 - 흐리거나 대비가 낮음)"
+            candidates = extract_imprint(image, contour)
+            entry["imprint"] = candidates[0] if candidates else "(인식 실패 - 흐리거나 대비가 낮음)"
+            # 우선순위 순서([합친것, 왼쪽만, 오른쪽만]) 그대로 보존 - DB 매칭 쪽에서
+            # 이 순서대로 하나씩 시도하는 건 추후 작업.
+            entry["imprint_candidates"] = candidates
         results.append(entry)
     return results
 
@@ -359,8 +435,9 @@ def diagnose_from_mask(image: np.ndarray, mask: np.ndarray, with_imprint: bool =
     color_name, color_rgb = detect_color(image, mask)
     result = {"shape": shape, "color": color_name, "color_rgb": color_rgb}
     if with_imprint:
-        imprint = extract_imprint(image, contour)
-        result["imprint"] = imprint or ""
+        candidates = extract_imprint(image, contour)
+        result["imprint"] = candidates[0] if candidates else ""
+        result["imprint_candidates"] = candidates
     return result
 
 
