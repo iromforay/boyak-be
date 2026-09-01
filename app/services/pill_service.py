@@ -61,7 +61,10 @@ class PillService:
 
         rows = self._model.find_by_shape_color(shape, color, norm_imprint)
         if not rows:
-            rows = self._model.find_by_shape_color(shape, color, norm_imprint, imprint_like=True)
+            patterns = self._imprint_like_patterns(norm_imprint)
+            rows = self._model.find_by_shape_color(
+                shape, color, norm_imprint, imprint_like=True, imprint_like_patterns=patterns
+            )
         if not rows:
             rows = self._model.find_by_shape_color(shape, color)
         return [self._to_drug(row) for row in rows]
@@ -93,3 +96,19 @@ class PillService:
         if not text:
             return ""
         return "".join(text.split()).upper()
+
+    @staticmethod
+    def _imprint_like_patterns(imprint: str) -> tuple[str, str]:
+        """분할선 좌/우 한쪽만 신뢰할 수 있을 때를 대비해, 각 쪽을 앵커로 삼은
+        LIKE 패턴 두 개를 만든다. OCR이 분할선 한쪽 글자를 오독해도(예: "8"을
+        "0"으로) 반대쪽 앵커로 여전히 정답을 찾을 수 있다 - 실측 확인
+        (V분할선8을 V분할선0으로 오독한 사례에서 좌측 앵커만으로 정답 포함).
+        분할선이 없는 각인(예: "KK")은 기존처럼 양쪽 와일드카드 하나로 처리.
+        """
+        if "분할선" not in imprint:
+            pat = f"%{imprint}%"
+            return pat, pat
+        left, right = imprint.split("분할선", 1)
+        left_pat = f"{left}분할선%" if left else "분할선%"
+        right_pat = f"%분할선{right}" if right else "%분할선"
+        return left_pat, right_pat

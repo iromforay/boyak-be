@@ -32,14 +32,20 @@ _SEARCH_SQL_WITH_IMPRINT = """
     LIMIT 50
 """
 
-# OCR이 각인 일부만 읽었을 때(예: "V" - DB엔 "V분할선8") 완전일치가 실패하므로
-# 부분일치로 한 번 더 시도하는 용도.
+# OCR이 각인 일부만 읽었거나(예: "V" - DB엔 "V분할선8") 분할선 반대쪽 글자를
+# 오독했을 때(예: "8"을 "0"으로) 완전일치가 실패하므로 부분일치로 한 번 더
+# 시도하는 용도. left_pat/right_pat 둘 다 넘겨서 "왼쪽은 맞음, 오른쪽은 틀림"
+# 또는 "오른쪽은 맞음, 왼쪽은 틀림" 두 경우를 OR로 동시에 커버한다 - 실측
+# 확인(V분할선8을 V분할선0으로 오독한 사례): LIKE 'V분할선%'만으로 35건 중
+# 정답 포함, LIKE '%분할선0'만으로는 정답 없음(20건), 둘을 OR하면 55건이고
+# 정답이 여전히 포함됨 - 즉 한쪽이 틀려도 다른 쪽 앵커로 복구된다.
 _SEARCH_SQL_WITH_IMPRINT_LIKE = """
     SELECT item_seq, item_name, entp_name, chart, drug_shape, color_class1,
            color_class2, print_front, print_back, class_name, etc_otc_name,
            item_permit_date
     FROM product
-    WHERE drug_shape = %s AND (color_class1 = %s OR color_class2 = %s) AND (print_front LIKE %s OR print_back LIKE %s)
+    WHERE drug_shape = %s AND (color_class1 = %s OR color_class2 = %s)
+      AND (print_front LIKE %s OR print_front LIKE %s OR print_back LIKE %s OR print_back LIKE %s)
     ORDER BY item_name
     LIMIT 50
 """
@@ -56,7 +62,14 @@ _SEARCH_BY_NAME_SQL = """
 
 
 class PillModel:
-    def find_by_shape_color(self, shape: str, color: str, imprint: str | None = None, imprint_like: bool = False) -> list[dict]:
+    def find_by_shape_color(
+        self,
+        shape: str,
+        color: str,
+        imprint: str | None = None,
+        imprint_like: bool = False,
+        imprint_like_patterns: tuple[str, str] | None = None,
+    ) -> list[dict]:
         try:
             conn = get_connection()
         except pymysql.MySQLError:
@@ -65,8 +78,11 @@ class PillModel:
         try:
             with conn.cursor() as cur:
                 if imprint and imprint_like:
-                    like = f"%{imprint}%"
-                    cur.execute(_SEARCH_SQL_WITH_IMPRINT_LIKE, (shape, color, color, like, like))
+                    left_pat, right_pat = imprint_like_patterns or (f"%{imprint}%", f"%{imprint}%")
+                    cur.execute(
+                        _SEARCH_SQL_WITH_IMPRINT_LIKE,
+                        (shape, color, color, left_pat, right_pat, left_pat, right_pat),
+                    )
                 elif imprint:
                     cur.execute(_SEARCH_SQL_WITH_IMPRINT, (shape, color, color, imprint, imprint))
                 else:
