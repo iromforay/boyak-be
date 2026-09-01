@@ -32,4 +32,12 @@ venv/bin/pip install -r requirements.txt
 echo "== 설치 확인 =="
 venv/bin/python -c "import fastapi, cv2, torch, pytesseract; print('ok')"
 
+echo "== FastSAM 모델 가중치 다운로드 (없으면) =="
+# 첫 실제 사용자 요청 때 지연/실패 없도록 미리 받아둔다 (약 23MB).
+if [ ! -f FastSAM-s.pt ]; then
+    venv/bin/python -c "from ultralytics import FastSAM; FastSAM('FastSAM-s.pt')"
+else
+    echo "FastSAM-s.pt 이미 있음, 건너뜀"
+fi
+
 echo "== 완료. 실행: ./run.sh =="
