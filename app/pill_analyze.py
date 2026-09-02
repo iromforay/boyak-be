@@ -12,6 +12,7 @@
 
 import io
 import sys
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -19,9 +20,24 @@ import numpy as np
 if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
+# ML/이 있으면(로컬 학습 + 배포된 가중치 파일) 학습 기반 모양 분류기를 쓰고,
+# 없거나 로드 실패하면 규칙 기반 classify_shape()로 조용히 폴백한다 - ML/
+# 자체가 서버에 아직 안 올라갔을 수도 있어서(ImportError) try/except로
+# 감싼다. 2026-09-01 검증(참고사진 118건): 규칙 기반 대비 정확도
+# 78.8% -> 90.7% (ML/evaluate_shape_classifier.py 참고).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ML"))
+try:
+    from infer_shape import predict_shape as _predict_shape_ml
+except ImportError:
+    _predict_shape_ml = None
+
 NAMED_COLORS = {
+    # "ivory"는 DB(product.color_class1/2)에 단 1건도 없는 값이라(MFDS 원본
+    # 데이터에 사실상 안 쓰임 - 실측 확인) 여기 팔레트에 있으면 흰색에
+    # 가까운 알약이 최근접 매칭으로 ivory에 걸려 검색 결과가 0건이 되는
+    # 버그가 생긴다. 그래서 일부러 뺐다 - 흰색 계열은 전부 "white"로
+    # 흡수되게 한다.
     "white": (255, 255, 255),
-    "ivory": (240, 234, 214),
     "yellow": (255, 221, 51),
     "orange": (255, 140, 40),
     "pink": (255, 175, 190),
@@ -207,8 +223,14 @@ def classify_shape(contour) -> str:
     (_, _), (w, h), _ = rect
     aspect_ratio = max(w, h) / max(min(w, h), 1e-6)
 
-    if aspect_ratio >= 2.4:
-        return "capsule"
+    # "capsule" 카테고리는 일부러 안 쓴다 - 실측 확인: MFDS 원본 데이터는
+    # 캡슐형 약도 DRUG_SHAPE을 "장방형"이나 "타원형"으로 등록한다("캡슐형"
+    # 값 자체가 원본에 없음). 그래서 여기서 종횡비만으로 capsule로 조기
+    # 판정하면 DB에 아예 없는 값이라 검색이 항상 0건이 된다(ivory 색상과
+    # 동일한 패턴의 버그). 매끈한 캡슐형 윤곽은 원형도가 높아 아래
+    # round/oval/oblong 분기를 그대로 타므로(검증: 종횡비 1.5~8 전 구간에서
+    # 스타디움의 상대 원형도가 0.82 문턱을 항상 넘음), 자연스럽게 타원/장방형
+    # 중 하나로 갈린다 - MFDS의 실제 라벨링 방식과 일치한다.
 
     # 마스크 경계 잡음은 둘레를 크게 부풀려 원형도를 낮추므로, 볼록 껍질(convex
     # hull) 둘레로 계산해 잡음의 영향을 줄인다.
@@ -223,7 +245,24 @@ def classify_shape(contour) -> str:
     if relative_circularity >= 0.82:
         # 그림자가 마스크를 한쪽으로 살짝 늘리는 경우가 흔해서, 완전한 원도
         # 종횡비가 1.0보다 다소 크게 측정된다. 여유를 두고 판단한다.
-        return "round" if aspect_ratio < 1.25 else "oval"
+        if aspect_ratio < 1.25:
+            return "round"
+        # 장방형(스타디움 - 직선 옆면 + 반원 양끝)은 원형도만으로는 타원과
+        # 구분이 안 된다(실측 확인: 종횡비 2.19에서 완벽한 장방형의 상대
+        # 원형도가 오히려 이상적 타원보다 높게 나옴). 대신 "윤곽 면적 /
+        # bounding box 면적" 비율을 쓰면 확실히 갈린다 - 타원은 종횡비와
+        # 무관하게 항상 π/4(~0.785)로 일정하지만, 장방형은 종횡비가
+        # 커질수록 1에 가까워진다(옆면이 직선이라 박스를 거의 다 채움).
+        # 두 이론값의 중간을 기준선으로 삼는다. 합성 도형(매끈함+세그멘테이션
+        # 잡음 흉내) 검증: 종횡비 1.25~2.3 전 구간에서 오분류 0건.
+        hull_area = cv2.contourArea(cv2.convexHull(contour))
+        bbox_area = w * h
+        if bbox_area > 0:
+            ellipse_ratio = np.pi / 4
+            stadium_ratio = 1 - (1 - np.pi / 4) / aspect_ratio
+            if hull_area / bbox_area >= (ellipse_ratio + stadium_ratio) / 2:
+                return "oblong"
+        return "oval"
 
     epsilon = 0.035 * raw_perimeter
     approx = cv2.approxPolyDP(contour, epsilon, True)
@@ -244,6 +283,16 @@ def classify_shape(contour) -> str:
     # 7각형 등 애매하게 남는 다각형이나 근사가 잘 안 되는 경우는 억지로
     # 육각/팔각에 끼워 맞추지 않고 기타로 둔다.
     return "other"
+
+
+def _classify_shape(contour) -> str:
+    """모양 판정 진입점. ML 모델(ML/models/shape_classifier.joblib)이 있으면
+    그걸 우선 쓰고, 없거나 실패하면 규칙 기반 classify_shape()로 폴백한다."""
+    if _predict_shape_ml is not None:
+        predicted = _predict_shape_ml(contour)
+        if predicted is not None:
+            return predicted
+    return classify_shape(contour)
 
 
 def _closest_named_color(bgr):
@@ -406,7 +455,7 @@ def analyze(image_path: str, with_imprint: bool = True) -> list:
     results = []
     for contour in segment_pills(image):
         mask = build_mask(image.shape, contour)
-        shape = classify_shape(contour)
+        shape = _classify_shape(contour)
         color_name, color_rgb = detect_color(image, mask)
         entry = {"shape": shape, "color": color_name, "color_rgb": color_rgb, "contour": contour}
         if with_imprint:
@@ -431,7 +480,7 @@ def diagnose_from_mask(image: np.ndarray, mask: np.ndarray, with_imprint: bool =
         raise ValueError("마스크에서 영역을 찾지 못했습니다.")
     contour = max(contours, key=cv2.contourArea)
 
-    shape = classify_shape(contour)
+    shape = _classify_shape(contour)
     color_name, color_rgb = detect_color(image, mask)
     result = {"shape": shape, "color": color_name, "color_rgb": color_rgb}
     if with_imprint:
