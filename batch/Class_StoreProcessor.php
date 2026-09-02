@@ -337,9 +337,16 @@ class StoreProcessor{
     //      storage/data/sql/*.images.json 에 남겨둔 목록 (무조건 다시 받음)
     //   2) 누락분 - 전체 json을 훑어보되, 로컬에 파일이 아직 없는 것만 (예전
     //      실패분 백필). 이미 파일이 있으면 데이터가 안 바뀌었다는 뜻이므로 건너뜀.
-    public function run_image()
+    // $only_missing=true면 변경분 목록은 파일 소비(images_done 이동)만 하고
+    // 재다운로드 대상에서는 뺀다 - full_sync처럼 cache를 통째로 비워서
+    // 전체가 "변경"으로 잡힌 경우, 이미 로컬에 있는 이미지까지 전부 다시
+    // 받는 걸 막기 위함 (이미지 자체는 product/cache 초기화와 무관하게 유효).
+    public function run_image($only_missing = false)
     {
         $changed = $this->load_changed_image_targets();
+        if($only_missing){
+            $changed = [];
+        }
         $missing = $this->load_missing_image_targets();
         $targets = $changed + $missing; // 키(item_seq) 겹치면 changed 값이 우선 유지됨
 

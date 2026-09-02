@@ -40,6 +40,17 @@
  *   결과를 모으고 product 테이블 건수를 조회해 텔레그램으로 요약을 보낸다.
  *   (Reporter::run(), 매일 9시대에 exec.php가 호출)
  *
+ * full_sync CONFIRM
+ *   product/cache 테이블을 TRUNCATE한 뒤 gather(1페이지부터) -> parse_batch ->
+ *   exec_batch -> image를 이어서 한 번에 돌려 DB를 통째로 재구축한다.
+ *   cache가 비어있으니 parse_batch가 전체 아이템을 "변경"으로 잡아 전량
+ *   재삽입한다. 이미지는 그 "변경" 신호를 무시하고 누락분만 받는다(image
+ *   step에 run_image(true) - 로컬에 이미 있는 파일은 TRUNCATE와 무관하게
+ *   유효하므로 재다운로드하지 않음). TRUNCATE라 되돌릴 수 없어서 두번째
+ *   인자로 정확히 CONFIRM을 넘겨야만 실행되고, exec.php(크론)에는 걸어두지
+ *   않았다 - 필요할 때 사람이 직접 실행하는 용도다.
+ *   (run_full_sync())
+ *
  * 세 명령(gather/parse/image)은 서로 독립적으로 재실행 가능하며, 이 순서
  * (gather -> parse -> image)로 실행해야 의미가 있다. cron 연동은 exec.php(이
  * 파일과 다른 별도 진입점 파일) 참고.
@@ -70,6 +81,59 @@ function write_stats($command, $stats)
     $dir = __DIR__.DIRECTORY_SEPARATOR."..".DIRECTORY_SEPARATOR."storage".DIRECTORY_SEPARATOR."logs".DIRECTORY_SEPARATOR.date("Y-m-d");
     if(! is_dir($dir)) mkdir($dir, 0777, true);
     file_put_contents($dir.DIRECTORY_SEPARATOR.$command.".stats.json", json_encode($stats, JSON_UNESCAPED_UNICODE));
+}
+
+// product/cache를 TRUNCATE하고 gather->parse_batch->exec_batch->image를
+// 순서대로 이어서 실행한다. 사람이 필요할 때 직접 돌리는 전체 재연동 용도.
+function run_full_sync($link)
+{
+    echo "===================\n";
+    echo "전체 재연동 시작 : product/cache TRUNCATE\n";
+    $link->query("TRUNCATE TABLE cache");
+    $link->query("TRUNCATE TABLE product");
+
+    echo "-------------------\n";
+    echo "1) gather\n";
+    run_collect(1);
+
+    echo "-------------------\n";
+    echo "2) parse_batch\n";
+    write_stats('parse_batch', (new StoreProcessor($link))->run_batch());
+
+    echo "-------------------\n";
+    echo "3) exec_batch\n";
+    write_stats('exec_batch', (new StoreProcessor($link))->run_exec_batch());
+
+    echo "-------------------\n";
+    echo "4) image (누락분만 - 이미지는 TRUNCATE와 무관하게 유효하므로 이미 있는 파일은 재다운로드 안 함)\n";
+    write_stats('image', (new StoreProcessor($link))->run_image(true));
+
+    echo "===================\n";
+    echo "전체 재연동 완료\n";
+}
+
+// 인자 없이 실행했을 때(php process.php) 뭘 넣어야 하는지 보여준다. 파일 맨 위
+// 독스블록 내용 요약 - 자세한 설명은 그쪽 주석 참고.
+function print_usage()
+{
+    echo "사용법 : php process.php {명령어} [인자]\n";
+    echo "\n";
+    echo "명령어 목록 :\n";
+    echo "  gather [page=1]     - 공공API 수집, storage/data/[날짜]/page_NNN.json 저장 (DB 미반영)\n";
+    echo "  parse               - gather 결과를 건별로 바로 product/cache에 반영\n";
+    echo "  parse_batch         - gather 결과를 비교해 SQL 파일만 생성 (DB 미반영)\n";
+    echo "  exec_batch          - parse_batch가 만든 SQL 파일을 실제 실행 (DB 반영)\n";
+    echo "  image               - 이미지 다운로드 (변경분+누락분)\n";
+    echo "  once_exec {item_seq} - item_seq 하나만 API로 조회해보는 디버깅용\n";
+    echo "  report              - 오늘자 통계 + DB 현황을 텔레그램으로 발송\n";
+    echo "  full_sync CONFIRM   - product/cache TRUNCATE 후 gather->parse_batch->exec_batch->image 전체 재연동\n";
+    echo "\n";
+    echo "cron 연동은 exec.php 참고 (매일 3시대 gather, 4시대 parse_batch/exec_batch, 5시대 image, 9시대 report).\n";
+}
+
+if(! isset($argv[1]) || $argv[1] == ""){
+    print_usage();
+    exit(1);
 }
 
 if($argv[1] == "gather") {
@@ -104,4 +168,14 @@ else if($argv[1] == 'report'){
     $link = get_connect();
     $reporter = new Reporter($link);
     $reporter->run();
+}
+else if($argv[1] == 'full_sync'){
+    if(($argv[2] ?? '') !== 'CONFIRM'){
+        echo "전체 재연동은 product/cache 테이블을 TRUNCATE합니다 (되돌릴 수 없음).\n";
+        echo "정말 실행하려면 다음과 같이 CONFIRM을 붙여서 실행하세요:\n";
+        echo "  php process.php full_sync CONFIRM\n";
+        exit(1);
+    }
+    $link = get_connect();
+    run_full_sync($link);
 }
