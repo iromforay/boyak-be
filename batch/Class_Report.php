@@ -99,14 +99,13 @@ class Reporter
         }
 
         $token = (strpos($secret, ':') !== false || ! $bot_id) ? $secret : ($bot_id.":".$secret);
-        $url = "https://api.telegram.org/bot".$token."/sendMessage";
-
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+        $query = http_build_query([
             'chat_id' => $chat_id,
             'text' => $text,
-        ]));
+        ]);
+        $url = "https://api.telegram.org/bot".$token."/sendMessage?".$query;
+
+        $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_TIMEOUT, 15);
         $response = curl_exec($ch);
@@ -116,6 +115,7 @@ class Reporter
         if($code == 200){
             echo "텔레그램 전송 완료\n";
         }else{
+            echo "url : ".$url."\n";
             echo "텔레그램 전송 실패(".$code.") : ".$response."\n";
         }
     }
