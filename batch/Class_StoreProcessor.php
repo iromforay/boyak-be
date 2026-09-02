@@ -123,6 +123,12 @@ class StoreProcessor{
             file_put_contents($sql_file, $sql_text);
             echo "SQL 파일 저장 : ".$sql_file." (실행은 exec_batch에서)\n";
 
+            // 이 파일에 담긴 item_seq 목록. 파일 전체가 하나의 트랜잭션이라 실행이
+            // 실패하면 이 목록 전부가 롤백된 것 - exec_batch가 실패 시 어떤
+            // item_seq가 반영 안 됐는지 추적하는 데 쓴다.
+            $items_file = $this->items_manifest_path($sql_file);
+            file_put_contents($items_file, json_encode(array_keys($rows), JSON_UNESCAPED_UNICODE));
+
             if($image_targets){
                 $images_file = $sql_dir.DIRECTORY_SEPARATOR.$timestamp.".images.json";
                 file_put_contents($images_file, json_encode($image_targets, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
@@ -154,24 +160,77 @@ class StoreProcessor{
         echo "실행 대상 SQL 파일 수 : ".count($files)."\n";
 
         $success = 0;
+        $failed_item_seqs = [];
         foreach($files as $file){
             echo "-------------------\n";
             echo "실행 : ".$file."\n";
             $sql_text = file_get_contents($file);
-            $ok = $this->run_sql_batch($sql_text);
-            if($ok){
+            $result = $this->run_sql_batch($sql_text);
+            $items_file = $this->items_manifest_path($file);
+            if($result === true){
                 rename($file, $done_dir.DIRECTORY_SEPARATOR.basename($file));
+                if(is_file($items_file)){
+                    rename($items_file, $done_dir.DIRECTORY_SEPARATOR.basename($items_file));
+                }
                 $success++;
             }else{
                 // 실패한 파일은 done으로 옮기지 않고 그대로 둔다 (원인 고친 뒤 재실행하면
                 // 다음 exec_batch 호출 때 다시 이 파일부터 시도된다). 이후 파일들도
                 // 순서가 꼬이면 안 되니 여기서 멈춘다.
                 echo "실패해서 done으로 안 옮김, 뒤 파일은 건너뛴다 : ".$file."\n";
+                // 파일 전체가 한 트랜잭션이라 실패하면 이 파일에 담긴 item_seq 전부가
+                // 롤백된 것 - manifest에서 읽어와 실패 목록에 더하고, 원인(에러 메시지)과
+                // 함께 storage/logs/sql_failures.jsonl 에 날짜 상관없이 계속 누적 기록한다
+                // (스키마/데이터 매칭 문제 디버깅용 - report의 당일 stats.json과 달리
+                // 여기는 지우지 않고 계속 쌓인다).
+                $seqs = [];
+                if(is_file($items_file)){
+                    $decoded = json_decode(file_get_contents($items_file), true);
+                    if(is_array($decoded)){
+                        $seqs = $decoded;
+                        $failed_item_seqs = array_merge($failed_item_seqs, $seqs);
+                    }
+                }
+                $this->log_sql_failure($file, $result, $seqs);
                 break;
             }
         }
 
-        return ['total' => count($files), 'success' => $success, 'fail' => count($files) - $success];
+        return [
+            'total' => count($files),
+            'success' => $success,
+            'fail' => count($files) - $success,
+            'failed_item_seqs' => $failed_item_seqs,
+        ];
+    }
+
+    // SQL 실행 실패 건을 storage/logs/sql_failures.jsonl 에 한 줄씩 계속 누적
+    // 기록한다(날짜 폴더 구분 없이 append-only). openAPI 스펙이 바뀌어 컬럼
+    // 길이 초과/형식 불일치 등으로 실패하는 경우, 나중에 item_seq로 grep해서
+    // 언제 무슨 에러로 실패했는지 히스토리를 볼 수 있게 하기 위함 - 당일
+    // report용 stats.json(그날 것만 남고 덮어써짐)과는 용도가 다르다.
+    private function log_sql_failure($sql_file, $error, $item_seqs)
+    {
+        $log_dir = __DIR__.DIRECTORY_SEPARATOR."..".DIRECTORY_SEPARATOR."storage".DIRECTORY_SEPARATOR."logs";
+        if(! is_dir($log_dir)) mkdir($log_dir, 0777, true);
+
+        $entry = [
+            'time' => date('c'),
+            'sql_file' => basename($sql_file),
+            'error' => $error,
+            'item_seq' => $item_seqs,
+        ];
+        file_put_contents(
+            $log_dir.DIRECTORY_SEPARATOR."sql_failures.jsonl",
+            json_encode($entry, JSON_UNESCAPED_UNICODE)."\n",
+            FILE_APPEND
+        );
+    }
+
+    // sql 파일 경로에서 대응되는 item_seq manifest(.items.json) 경로를 만든다.
+    private function items_manifest_path($sql_file)
+    {
+        return preg_replace('/\.sql$/', '.items.json', $sql_file);
     }
 
     // cache 테이블 전체를 한 번에 읽어 [item_seq => hash] 배열로 돌려준다.
@@ -276,6 +335,7 @@ class StoreProcessor{
     // 중 하나(예: 컬럼 길이 초과)가 실패하면 잡아서 롤백하고 false를 돌려준다.
     // (이걸 안 잡으면 전체 PHP 프로세스가 죽어서, 이 파일 뒤에 든 아직
     // 손도 안 댄 데이터까지 통째로 유실되는 걸 겪은 적이 있다.)
+    // 성공하면 true, 실패하면 원인 파악용으로 에러 메시지(string)를 돌려준다.
     private function run_sql_batch($sql_text)
     {
         try{
@@ -289,13 +349,13 @@ class StoreProcessor{
         }catch(\mysqli_sql_exception $e){
             echo "SQL 실행 오류(예외) : ".$e->getMessage()."\n";
             $this->drain_and_rollback();
-            return false;
+            return $e->getMessage();
         }
 
         if($this->link->errno){
             echo "SQL 실행 오류 : ".$this->link->error."\n";
             $this->drain_and_rollback();
-            return false;
+            return $this->link->error;
         }
 
         echo "SQL 실행 완료\n";

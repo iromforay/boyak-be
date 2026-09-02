@@ -35,9 +35,11 @@
  * once_exec {item_seq}
  *   단건 조회 디버깅용. item_seq 하나만 API로 조회해 json 저장까지 해본다.
  *
- * report
+ * report [dev]
  *   parse_batch/exec_batch/image가 오늘 storage/logs/[Y-m-d]/*.stats.json 에 남긴
  *   결과를 모으고 product 테이블 건수를 조회해 텔레그램으로 요약을 보낸다.
+ *   두번째 인자로 dev를 주면(report dev) 메시지만 콘솔에 출력하고 텔레그램
+ *   전송은 스킵한다 - 개발/확인용.
  *   (Reporter::run(), 매일 9시대에 exec.php가 호출)
  *
  * full_sync CONFIRM
@@ -125,7 +127,7 @@ function print_usage()
     echo "  exec_batch          - parse_batch가 만든 SQL 파일을 실제 실행 (DB 반영)\n";
     echo "  image               - 이미지 다운로드 (변경분+누락분)\n";
     echo "  once_exec {item_seq} - item_seq 하나만 API로 조회해보는 디버깅용\n";
-    echo "  report              - 오늘자 통계 + DB 현황을 텔레그램으로 발송\n";
+    echo "  report [dev]        - 오늘자 통계 + DB 현황을 텔레그램으로 발송 (dev 붙이면 출력만 하고 전송은 스킵)\n";
     echo "  full_sync CONFIRM   - product/cache TRUNCATE 후 gather->parse_batch->exec_batch->image 전체 재연동\n";
     echo "\n";
     echo "cron 연동은 exec.php 참고 (매일 3시대 gather, 4시대 parse_batch/exec_batch, 5시대 image, 9시대 report).\n";
@@ -167,7 +169,9 @@ else if($argv[1] == 'exec_batch'){
 else if($argv[1] == 'report'){
     $link = get_connect();
     $reporter = new Reporter($link);
-    $reporter->run();
+    // 두번째 인자로 dev를 주면 텔레그램 전송 없이 메시지만 출력한다 (개발용)
+    $dry_run = ($argv[2] ?? '') === 'dev';
+    $reporter->run($dry_run);
 }
 else if($argv[1] == 'full_sync'){
     if(($argv[2] ?? '') !== 'CONFIRM'){
