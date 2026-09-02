@@ -7,6 +7,12 @@ React 프론트가 직접 호출하는 API. 중간 단계 없이 파이썬이 �
   POST /reanalyze    (JSON: image_path, target_id, mask_png_base64)
                       -> 마스크로 즉시 재진단 + 학습용 교정 데이터 저장
   POST /drug_lookup  (JSON: shape, color) -> 모양+색상으로 약 이름 후보 조회
+  POST /reject_target (JSON: image_path, target_id, shape, color, points)
+                      -> 오검출(미대상) 기록 (검출 단계 재학습용 음성 예제)
+  POST /confirm_result (JSON: image_path, target_id, item_seq)
+                      -> 결과화면에서 "이 약이 맞다" 확정 (모양 분류기
+                         학습용 - 확정된 item_seq의 DB drug_shape가 이
+                         사진/영역의 정답 라벨이 된다)
   GET  /images/{name} -> 업로드된 이미지 정적 서빙
   GET  /health
 
@@ -44,6 +50,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 STORAGE_DIR = BASE_DIR / "storage" / "images"
 CORRECTIONS_DIR = BASE_DIR / "storage" / "ml_corrections"
 CORRECTIONS_LOG = BASE_DIR / "storage" / "ml_corrections.jsonl"
+REJECTIONS_LOG = BASE_DIR / "storage" / "ml_rejections.jsonl"
+CONFIRMATIONS_LOG = BASE_DIR / "storage" / "ml_confirmations.jsonl"
 DRUG_IMAGE_DIR = BASE_DIR / "storage" / "drug_image"  # batch(PHP)가 채워 넣는 참고 이미지
 
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -75,6 +83,20 @@ class DrugLookupRequest(BaseModel):
     shape: str
     color: str
     imprint: Optional[str] = None
+
+
+class RejectTargetRequest(BaseModel):
+    image_path: str
+    target_id: Optional[Union[int, str]] = None
+    shape: str
+    color: str
+    points: list
+
+
+class ConfirmResultRequest(BaseModel):
+    image_path: str
+    target_id: Optional[Union[int, str]] = None
+    item_seq: str
 
 
 def _decode_mask_png(mask_b64: str, shape) -> np.ndarray:
@@ -110,6 +132,37 @@ def _save_correction(image_path: str, target_id, mask: np.ndarray, result: dict)
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     return str(mask_path)
+
+
+def _save_rejection(body: "RejectTargetRequest") -> None:
+    """사람이 '미대상(오탐)'으로 표시한 FastSAM 검출 = 검출 단계 오탐 억제
+    학습에 쓸 음성(negative) 예제. 마스크 보정이 필요 없으니(애초에 알약이
+    아니라는 판정이라) 원본 폴리곤 좌표만 기록해둔다."""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "image_path": body.image_path,
+        "target_id": body.target_id,
+        "shape": body.shape,
+        "color": body.color,
+        "points": body.points,
+    }
+    with open(REJECTIONS_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _save_confirmation(body: "ConfirmResultRequest") -> None:
+    """결과화면에서 사용자가 "이 약이 맞다"고 확정한 건 = 모양 분류기 학습용
+    정답 라벨. 여기서 shape을 직접 조회해 저장하지 않고 item_seq만 남긴다 -
+    학습 데이터를 만들 때(ML/dataset_from_user_confirmations.py) product
+    테이블에서 그 시점 기준 drug_shape을 조인해서 쓴다."""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "image_path": body.image_path,
+        "target_id": body.target_id,
+        "item_seq": body.item_seq,
+    }
+    with open(CONFIRMATIONS_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _to_pills(results: list, w: int, h: int) -> list:
@@ -217,6 +270,28 @@ def drug_lookup(body: DrugLookupRequest):
         "drug_names": [d["item_name"] for d in drugs],
         "drugs": drugs,
     }
+
+
+@app.post("/reject_target")
+def reject_target(body: RejectTargetRequest):
+    """사용자가 '미대상(오탐)'으로 표시한 FastSAM 검출을 기록한다 (판독화면 -
+    '이건 알약이 아니다' 표시). 화면 응답에 영향 없이 로그만 남긴다."""
+    try:
+        _save_rejection(body)
+    except Exception:
+        pass  # 학습 데이터 저장 실패가 사용자 응답을 막으면 안 된다
+    return {"status": "ok"}
+
+
+@app.post("/confirm_result")
+def confirm_result(body: ConfirmResultRequest):
+    """결과화면에서 사용자가 특정 약으로 확정한 걸 기록한다 (모양 분류기
+    학습용 정답 라벨). 화면 응답에 영향 없이 로그만 남긴다."""
+    try:
+        _save_confirmation(body)
+    except Exception:
+        pass  # 학습 데이터 저장 실패가 사용자 응답을 막으면 안 된다
+    return {"status": "ok"}
 
 
 @app.get("/drug_search")

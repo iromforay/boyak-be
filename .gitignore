@@ -223,3 +223,6 @@ FastSAM-s.pt
 *.pt
 # storage/ : 업로드된 이미지, 교정 마스크, 학습 데이터 로그 (런타임 산출물)
 /storage/
+# ML/data, ML/models : 로컬에서 생성되는 학습셋/가중치 (코드 아님, 로컬 절대경로 포함)
+/ML/data/
+/ML/models/
