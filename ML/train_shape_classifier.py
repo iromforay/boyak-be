@@ -54,7 +54,8 @@ def _load_local_env() -> None:
     """batch/env.php와 같은 취지의 의존성 없는 초경량 로더 - ML/.env가 있으면
     읽어서 os.environ에 아직 없는 키만 채운다(커맨드라인/시스템 환경변수가
     항상 우선). ML_TRAIN_WORKERS처럼 로컬 PC마다 다른 설정을 매번 안 치고
-    파일에 넣어두고 싶을 때 쓴다."""
+    파일에 넣어두고 싶을 때 쓴다. `KEY=값 #설명` 처럼 값 뒤 인라인 주석도
+    지원한다(batch/env.php는 줄 전체가 #으로 시작할 때만 주석 처리라 이 점만 다름)."""
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.is_file():
         return
@@ -63,6 +64,7 @@ def _load_local_env() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
+        value = value.split("#", 1)[0]  # 값 뒤에 붙은 인라인 주석 제거
         key, value = key.strip(), value.strip().strip('"').strip("'")
         if key:
             os.environ.setdefault(key, value)

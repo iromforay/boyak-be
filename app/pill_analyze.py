@@ -11,7 +11,9 @@
 """
 
 import io
+import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -30,6 +32,30 @@ try:
     from infer_shape import predict_shape as _predict_shape_ml
 except ImportError:
     _predict_shape_ml = None
+
+# 섀도 모드 로그: 서빙되는 값(ML)은 그대로 두고, 규칙 기반 결과도 같이 계산해서
+# 둘이 일치하는지만 기록한다. ML/README.md의 검증 미해결 리스크(90.7%는
+# 스튜디오 참고사진 기준이라 실사용자 사진에서도 우위가 유지되는지 확인
+# 안 됨, hexagon/pentagon/triangle/semicircle 같은 소수 클래스는 표본 1~7건
+# 뿐이라 특히 못 믿음) 때문에, 실사용 로그가 쌓이기 전까지 ML로 완전 전환하지
+# 않고 이 로그로 실측 우위를 확인한다. storage/ml_confirmations.jsonl(사용자가
+# 확정한 진짜 정답)과 나중에 대조하면 실제 정확도 비교도 가능하다.
+_SHADOW_LOG_PATH = Path(__file__).resolve().parent.parent / "storage" / "ml_shadow.jsonl"
+
+
+def _log_shadow_comparison(ml_shape: str, rule_shape: str) -> None:
+    try:
+        _SHADOW_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ml_shape": ml_shape,
+            "rule_shape": rule_shape,
+            "match": ml_shape == rule_shape,
+        }
+        with open(_SHADOW_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # 로깅 실패가 실제 서빙(모양 판정 응답)을 막으면 안 된다
 
 NAMED_COLORS = {
     # "ivory"는 DB(product.color_class1/2)에 단 1건도 없는 값이라(MFDS 원본
@@ -287,12 +313,17 @@ def classify_shape(contour) -> str:
 
 def _classify_shape(contour) -> str:
     """모양 판정 진입점. ML 모델(ML/models/shape_classifier.joblib)이 있으면
-    그걸 우선 쓰고, 없거나 실패하면 규칙 기반 classify_shape()로 폴백한다."""
+    그걸 서빙하고, 없거나 실패하면 규칙 기반 classify_shape()로 폴백한다.
+    ML이 성공한 경우도 규칙 기반을 같이 계산해 storage/ml_shadow.jsonl에
+    일치 여부를 남긴다(섀도 모드 - 서빙 결과에는 영향 없음, _log_shadow_comparison
+    주석 참고)."""
+    rule_result = classify_shape(contour)
     if _predict_shape_ml is not None:
         predicted = _predict_shape_ml(contour)
         if predicted is not None:
+            _log_shadow_comparison(predicted, rule_result)
             return predicted
-    return classify_shape(contour)
+    return rule_result
 
 
 def _closest_named_color(bgr):

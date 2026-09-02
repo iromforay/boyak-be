@@ -9,3 +9,7 @@ numpy
 opencv-python
 easyocr
 ultralytics
+# shape_classifier.joblib(ML/train_shape_classifier.py 산출물) 추론용 - 학습 자체는
+# 로컬/Colab에서만 하지만, model.predict() 실행 자체엔 서버에도 필요하다.
+scikit-learn
+joblib
