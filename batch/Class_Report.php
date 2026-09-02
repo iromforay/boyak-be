@@ -54,22 +54,22 @@ class Reporter
                 $processed = 0;
                 $failed = 0;
             }
-            $lines[] = "- 총 연동 데이터 : ".$parse['total']."건";
-            $lines[] = "- 처리 완료 : ".$processed."건";
-            $lines[] = "- 처리 실패 : ".$failed."건";
+            $lines[] = "- 총 연동 데이터 : ".number_format($parse['total'])."건";
+            $lines[] = "- 처리 완료 : ".number_format($processed)."건";
+            $lines[] = "- 처리 실패 : ".number_format($failed)."건";
         }else{
             $lines[] = "- 오늘 실행 기록 없음";
         }
         $lines[] = "";
 
         $lines[] = "■ DB 현황";
-        $lines[] = "- 등록된 알약 : ".$this->get_product_count()."건";
+        $lines[] = "- 등록된 알약 : ".number_format($this->get_product_count())."건";
         $lines[] = "";
 
         $lines[] = "■ 이미지 연동";
         if($image){
-            $lines[] = "- 성공 : ".$image['done']."건";
-            $lines[] = "- 실패 : ".$image['fail']."건";
+            $lines[] = "- 성공 : ".number_format($image['done'])."건";
+            $lines[] = "- 실패 : ".number_format($image['fail'])."건";
         }else{
             $lines[] = "- 오늘 실행 기록 없음";
         }
