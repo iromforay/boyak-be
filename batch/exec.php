@@ -9,7 +9,9 @@
  *
  *   cron: * * * * * php /path/to/batch/exec.php >> /path/to/log/exec.log 2>&1
  *
- * 시간대 배정: 03시대 gather, 04시대 parse_batch->exec_batch, 05시대 image.
+ * 시간대 배정: 03시대 gather, 04시대 parse_batch->exec_batch, 05시대 image,
+ * 09시대 report(텔레그램 요약 발송). 07시대는 ML 증분 학습용으로 배정
+ * 예정(아직 서버 쪽 학습 스크립트 없음, ML/README.md 참고) - 비워둔다.
  * 뒤 단계가 앞 단계 결과물(json/sql)을 쓰므로 이 순서를 유지해야 한다.
  */
 
@@ -56,4 +58,8 @@ if ($hour == 4) { // 4시대 - DB 반영 (SQL 생성 -> 실행)
 
 if ($hour == 5) { // 5시대 - 이미지 다운로드
     _exec("image");
+}
+
+if ($hour == 9) { // 9시대 - 연동 결과 텔레그램 리포트
+    _exec("report");
 }

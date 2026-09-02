@@ -111,6 +111,8 @@ class StoreProcessor{
 
         echo "전체 ".$total."건 중 변경 ".count($rows)."건\n";
 
+        $changed = count($rows);
+
         if($rows){
             $sql_dir = $this->store_dir.DIRECTORY_SEPARATOR."sql";
             if(! is_dir($sql_dir)) mkdir($sql_dir, 0777, true);
@@ -133,6 +135,8 @@ class StoreProcessor{
         foreach($files as $file){
             $this->move_done($file);
         }
+
+        return ['total' => $total, 'changed' => $changed];
     }
 
     // run_batch()가 storage/data/sql/ 에 쌓아둔 .sql 파일들을 순서대로(파일명=시각
@@ -149,6 +153,7 @@ class StoreProcessor{
         echo "===================\n";
         echo "실행 대상 SQL 파일 수 : ".count($files)."\n";
 
+        $success = 0;
         foreach($files as $file){
             echo "-------------------\n";
             echo "실행 : ".$file."\n";
@@ -156,6 +161,7 @@ class StoreProcessor{
             $ok = $this->run_sql_batch($sql_text);
             if($ok){
                 rename($file, $done_dir.DIRECTORY_SEPARATOR.basename($file));
+                $success++;
             }else{
                 // 실패한 파일은 done으로 옮기지 않고 그대로 둔다 (원인 고친 뒤 재실행하면
                 // 다음 exec_batch 호출 때 다시 이 파일부터 시도된다). 이후 파일들도
@@ -164,6 +170,8 @@ class StoreProcessor{
                 break;
             }
         }
+
+        return ['total' => count($files), 'success' => $success, 'fail' => count($files) - $success];
     }
 
     // cache 테이블 전체를 한 번에 읽어 [item_seq => hash] 배열로 돌려준다.
@@ -337,7 +345,7 @@ class StoreProcessor{
 
         echo "===================\n";
         echo "이미지 대상 : 변경분 ".count($changed)."건 + 누락분 ".count($missing)."건 = 총 ".count($targets)."건\n";
-        $this->download_images($targets);
+        return $this->download_images($targets);
     }
 
     // run_batch()가 남겨둔 storage/data/sql/*.images.json (아직 소비 안 된 것들)을
@@ -466,5 +474,7 @@ class StoreProcessor{
         }
 
         echo "이미지 다운로드 완료 : ".$done."/".$total." (실패 ".$fail.")\n";
+
+        return ['total' => $total, 'done' => $done, 'fail' => $fail];
     }
 }

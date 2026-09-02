@@ -35,6 +35,11 @@
  * once_exec {item_seq}
  *   단건 조회 디버깅용. item_seq 하나만 API로 조회해 json 저장까지 해본다.
  *
+ * report
+ *   parse_batch/exec_batch/image가 오늘 storage/logs/[Y-m-d]/*.stats.json 에 남긴
+ *   결과를 모으고 product 테이블 건수를 조회해 텔레그램으로 요약을 보낸다.
+ *   (Reporter::run(), 매일 9시대에 exec.php가 호출)
+ *
  * 세 명령(gather/parse/image)은 서로 독립적으로 재실행 가능하며, 이 순서
  * (gather -> parse -> image)로 실행해야 의미가 있다. cron 연동은 exec.php(이
  * 파일과 다른 별도 진입점 파일) 참고.
@@ -42,6 +47,7 @@
 include "get_data.php";
 include "Class_product.php";
 include "Class_StoreProcessor.php";
+include "Class_Report.php";
 
 function run_collect($page = 1)
 {
@@ -56,6 +62,16 @@ function run_parse()
     $processor->run();
 }
 
+// parse_batch/exec_batch/image가 남긴 결과 통계를 storage/logs/[Y-m-d]/{command}.stats.json 으로 저장한다.
+// report 명령이 이 파일들을 읽어 텔레그램 리포트를 만든다.
+function write_stats($command, $stats)
+{
+    if($stats === null) return;
+    $dir = __DIR__.DIRECTORY_SEPARATOR."..".DIRECTORY_SEPARATOR."storage".DIRECTORY_SEPARATOR."logs".DIRECTORY_SEPARATOR.date("Y-m-d");
+    if(! is_dir($dir)) mkdir($dir, 0777, true);
+    file_put_contents($dir.DIRECTORY_SEPARATOR.$command.".stats.json", json_encode($stats, JSON_UNESCAPED_UNICODE));
+}
+
 if($argv[1] == "gather") {
     // 두번째 인자가 있으면 그 페이지부터, 없으면 1페이지부터 시작
     $page = isset($argv[2]) && $argv[2] !== '' ? (int)$argv[2] : 1;
@@ -65,7 +81,7 @@ if($argv[1] == "gather") {
 else if($argv[1] =="image"){
     $link = get_connect();
     $processor = new StoreProcessor($link);
-    $processor->run_image();
+    write_stats('image', $processor->run_image());
 }
 else if($argv[1] == 'once_exec'){
     $med = new Medicine();
@@ -77,10 +93,15 @@ else if($argv[1] == 'parse'){
 else if($argv[1] == 'parse_batch'){
     $link = get_connect();
     $processor = new StoreProcessor($link);
-    $processor->run_batch();
+    write_stats('parse_batch', $processor->run_batch());
 }
 else if($argv[1] == 'exec_batch'){
     $link = get_connect();
     $processor = new StoreProcessor($link);
-    $processor->run_exec_batch();
+    write_stats('exec_batch', $processor->run_exec_batch());
+}
+else if($argv[1] == 'report'){
+    $link = get_connect();
+    $reporter = new Reporter($link);
+    $reporter->run();
 }
