@@ -11,6 +11,7 @@ batch가 이미 받아둔 참고사진마다 DB에 확정된 drug_shape가 있�
 
 사용법 (venv의 pymysql/dotenv가 필요해서 반드시 venv 파이썬으로 실행):
   venv/Scripts/python.exe ML/dataset_from_reference_images.py [--output ML/data/reference_images.csv]
+  ./venv/bin/python ML/dataset_from_reference_images.py [--output ML/data/reference_images.csv]
 """
 
 import argparse

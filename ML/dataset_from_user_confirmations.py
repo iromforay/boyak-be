@@ -22,6 +22,7 @@ ml_corrections.jsonl에 마스크가 남아있는("reanalyzed") 건만 크롭 �
 
 사용법 (venv의 pymysql/dotenv가 필요해서 반드시 venv 파이썬으로 실행):
   venv/Scripts/python.exe ML/dataset_from_user_confirmations.py [--output ML/data/user_confirmations.csv]
+  ./venv/bin/python ML/dataset_from_user_confirmations.py [--output ML/data/user_confirmations.csv]
 """
 
 import argparse
