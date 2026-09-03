@@ -218,11 +218,11 @@ __marimo__/
 .streamlit/secrets.toml
 
 # boyak-be 전용
-# FastSAM-s.pt : 첫 실행 시 자동 다운로드되는 모델 가중치 (23MB, 코드 아님)
-FastSAM-s.pt
 *.pt
 # storage/ : 업로드된 이미지, 교정 마스크, 학습 데이터 로그 (런타임 산출물)
 /storage/
 # ML/data, ML/models : 로컬에서 생성되는 학습셋/가중치 (코드 아님, 로컬 절대경로 포함)
+# FastSAM-s.pt(첫 실행 시 자동 다운로드, 23MB)도 다른 학습 모델과 함께
+# 여기(ML/models/)에 모아둔다.
 /ML/data/
 /ML/models/
