@@ -280,6 +280,11 @@ async def upload(image: UploadFile = File(...)):
         raise HTTPException(400, "이미지를 읽을 수 없습니다.")
     h, w = cv_image.shape[:2]
 
+    # 폰 사진엔 위치정보(GPS) 등 EXIF 메타데이터가 남아있을 수 있다 - cv2로
+    # 다시 인코딩해서 저장하면 픽셀만 남고 메타데이터는 사라진다(수집 자체를
+    # 안 하는 것과 같은 효과 - 개인정보처리방침에 별도 항목을 추가할 필요가 없다).
+    cv2.imwrite(str(dest), cv_image)
+
     try:
         results = diagnose_image(str(dest), save_overlay=False)
     except Exception as e:
