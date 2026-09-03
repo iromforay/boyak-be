@@ -44,18 +44,24 @@ def _get_model_bundle():
     return _MODEL_BUNDLE
 
 
-def predict_shape(contour) -> str | None:
-    """모양 라벨을 예측한다. 모델을 못 쓰면(파일 없음/로드 실패) None."""
+def predict_shape(contour) -> tuple[str, float] | tuple[None, float]:
+    """(모양 라벨, 신뢰도 0~1)을 예측한다. 신뢰도는 RandomForest
+    predict_proba()의 최댓값(트리 200개 중 이 라벨을 고른 비율) - 확률로서
+    엄밀한 보정(calibration)은 안 돼있지만, 상대적으로 낮은 예측을 가려내는
+    용도로는 충분하다. 모델을 못 쓰면(파일 없음/로드 실패) (None, 0.0)."""
     bundle = _get_model_bundle()
     if bundle is None:
-        return None
+        return None, 0.0
 
     from shape_features import features_from_contour
 
     feats = features_from_contour(contour)
     if feats is None:
-        return None
+        return None, 0.0
 
     model, encoder = bundle["model"], bundle["label_encoder"]
-    pred = model.predict(feats.reshape(1, -1))
-    return encoder.inverse_transform(pred)[0]
+    probs = model.predict_proba(feats.reshape(1, -1))[0]
+    best_idx = int(probs.argmax())
+    confidence = float(probs[best_idx])
+    label = encoder.inverse_transform([best_idx])[0]
+    return label, confidence

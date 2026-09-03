@@ -13,6 +13,9 @@ React 프론트가 직접 호출하는 API. 중간 단계 없이 파이썬이 �
                       -> 결과화면에서 "이 약이 맞다" 확정 (모양 분류기
                          학습용 - 확정된 item_seq의 DB drug_shape가 이
                          사진/영역의 정답 라벨이 된다)
+  POST /correct_label (JSON: image_path, target_id, points, field, value)
+                      -> 탐지 영역은 맞는데 모양/색상/각인 라벨만 틀렸을 때
+                         마스킹 없이 바로 정답 교정 (재학습용 raw 데이터로 축적)
   GET  /images/{name} -> 업로드된 이미지 정적 서빙
   GET  /health
 
@@ -52,10 +55,13 @@ CORRECTIONS_DIR = BASE_DIR / "storage" / "ml_corrections"
 CORRECTIONS_LOG = BASE_DIR / "storage" / "ml_corrections.jsonl"
 REJECTIONS_LOG = BASE_DIR / "storage" / "ml_rejections.jsonl"
 CONFIRMATIONS_LOG = BASE_DIR / "storage" / "ml_confirmations.jsonl"
+LABEL_CORRECTIONS_DIR = BASE_DIR / "storage" / "ml_label_corrections"
+LABEL_CORRECTIONS_LOG = BASE_DIR / "storage" / "ml_label_corrections.jsonl"
 DRUG_IMAGE_DIR = BASE_DIR / "storage" / "drug_image"  # batch(PHP)가 채워 넣는 참고 이미지
 
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 CORRECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+LABEL_CORRECTIONS_DIR.mkdir(parents=True, exist_ok=True)
 DRUG_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="보이는 알약(보약) API")
@@ -97,6 +103,14 @@ class ConfirmResultRequest(BaseModel):
     image_path: str
     target_id: Optional[Union[int, str]] = None
     item_seq: str
+
+
+class CorrectLabelRequest(BaseModel):
+    image_path: str
+    target_id: Optional[Union[int, str]] = None
+    points: list  # /upload가 내려준 정규화(0~1) 폴리곤 좌표 그대로 - 탐지 영역 자체는 맞음
+    field: str  # "shape" | "color" | "imprint"
+    value: str
 
 
 def _decode_mask_png(mask_b64: str, shape) -> np.ndarray:
@@ -165,6 +179,55 @@ def _save_confirmation(body: "ConfirmResultRequest") -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _contour_from_points(points: list, image_shape) -> np.ndarray:
+    """/upload가 내려준 정규화(0~1) 폴리곤 좌표를 원본 이미지 픽셀 좌표의
+    컨투어로 되돌린다 - 탐지 영역은 맞으므로 재탐지 없이 그대로 재구성."""
+    h, w = image_shape[:2]
+    pts = np.array([[round(x * w), round(y * h)] for x, y in points], dtype=np.int32)
+    return pts.reshape(-1, 1, 2)
+
+
+def _save_label_correction(body: "CorrectLabelRequest") -> None:
+    """탐지 영역(폴리곤)은 맞는데 모양/색상/각인 "라벨"만 틀렸을 때 사용자가
+    직접 고친 정답을 raw 데이터로 쌓아둔다 - 마스킹 교정(_save_correction)과
+    달리 마스크를 다시 그릴 필요 없이, 이미 탐지된 폴리곤(points)에서
+    마스크/크롭을 그대로 재구성한다. 모양/색상 재학습엔 마스크(컨투어)가,
+    각인 재학습엔 크롭 이미지가 필요해서 어느 필드를 고쳤든 둘 다 저장해둔다."""
+    image = cv2.imread(body.image_path)
+    if image is None:
+        raise HTTPException(400, f"이미지를 찾을 수 없습니다: {body.image_path}")
+
+    contour = _contour_from_points(body.points, image.shape)
+
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, 255, -1)
+
+    x, y, w, h = cv2.boundingRect(contour)
+    pad = int(0.05 * max(w, h))
+    x0, y0 = max(x - pad, 0), max(y - pad, 0)
+    x1, y1 = min(x + w + pad, image.shape[1]), min(y + h + pad, image.shape[0])
+    crop = image[y0:y1, x0:x1]
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+    stem = f"{Path(body.image_path).stem}_{body.target_id}"
+    mask_path = LABEL_CORRECTIONS_DIR / f"{ts}_{stem}_mask.png"
+    crop_path = LABEL_CORRECTIONS_DIR / f"{ts}_{stem}_crop.png"
+    cv2.imwrite(str(mask_path), mask)
+    cv2.imwrite(str(crop_path), crop)
+
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "image_path": body.image_path,
+        "target_id": body.target_id,
+        "field": body.field,
+        "value": body.value,
+        "mask_path": str(mask_path),
+        "crop_path": str(crop_path),
+    }
+    with open(LABEL_CORRECTIONS_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def _to_pills(results: list, w: int, h: int) -> list:
     pills = []
     for i, r in enumerate(results, 1):
@@ -176,11 +239,17 @@ def _to_pills(results: list, w: int, h: int) -> list:
             {
                 "index": i,
                 "shape": r["shape"],
+                # ML(RandomForest)이 서빙됐을 때만 0~1 값, 규칙 기반 폴백이면 null
+                # (규칙 기반은 확률 개념이 없음). 색상은 애초에 확률 기반이 아니라 신뢰도 없음.
+                "shape_confidence": r.get("shape_confidence"),
                 "color": r["color"],
                 "shape_label": pill_service.get_shape_label(r["shape"]),
                 "color_label": pill_service.get_color_label(r["color"]),
                 "color_rgb": list(r["color_rgb"]),
                 "imprint": r.get("imprint", ""),
+                # ML(CRNN)이 서빙됐을 때만 0~1 값, EasyOCR 폴백이면 null - FE가 낮은
+                # 신뢰도일 때 사용자 교정을 유도할지 판단하는 근거로 쓴다.
+                "imprint_confidence": r.get("imprint_confidence"),
                 "points": points,
             }
         )
@@ -251,11 +320,13 @@ def reanalyze(body: ReanalyzeRequest):
         "image_path": image_path,
         "target_id": body.target_id,
         "shape": result["shape"],
+        "shape_confidence": result.get("shape_confidence"),
         "color": result["color"],
         "shape_label": pill_service.get_shape_label(result["shape"]),
         "color_label": pill_service.get_color_label(result["color"]),
         "color_rgb": list(result["color_rgb"]),
         "imprint": result.get("imprint", ""),
+        "imprint_confidence": result.get("imprint_confidence"),
     }
 
 
@@ -289,6 +360,23 @@ def confirm_result(body: ConfirmResultRequest):
     학습용 정답 라벨). 화면 응답에 영향 없이 로그만 남긴다."""
     try:
         _save_confirmation(body)
+    except Exception:
+        pass  # 학습 데이터 저장 실패가 사용자 응답을 막으면 안 된다
+    return {"status": "ok"}
+
+
+@app.post("/correct_label")
+def correct_label(body: CorrectLabelRequest):
+    """판독/결과화면에서 언제든 "모양/색상/각인이 틀렸다"고 사용자가 직접
+    고친 값을 기록한다 (탐지 영역은 맞으므로 마스킹 불필요). 화면 응답에
+    영향 없이 재학습용 raw 데이터만 남기고, 실제 약 찾기는 FE가 고친 값으로
+    바로 /drug_lookup을 호출해 처리한다."""
+    if body.field not in ("shape", "color", "imprint"):
+        raise HTTPException(400, f"알 수 없는 field 입니다: {body.field}")
+    try:
+        _save_label_correction(body)
+    except HTTPException:
+        raise
     except Exception:
         pass  # 학습 데이터 저장 실패가 사용자 응답을 막으면 안 된다
     return {"status": "ok"}

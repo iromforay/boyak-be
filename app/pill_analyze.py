@@ -33,6 +33,16 @@ try:
 except ImportError:
     _predict_shape_ml = None
 
+# 각인(imprint) 인식도 같은 패턴 - ML/models/imprint_crnn.pt가 있으면 그걸
+# 우선 쓰고, 없거나 예측 실패하면 기존 EasyOCR 방식(extract_imprint)으로
+# 폴백한다. 검증 결과(2026-09-03, ML/IMPRINT/evaluate_imprint_model.py,
+# 검증셋 2,300건): 정확 일치율 EasyOCR 21.3% -> CRNN 75.7%, 인식 실패율
+# 50.7% -> 0.0%.
+try:
+    from infer_imprint import predict_imprint as _predict_imprint_ml
+except ImportError:
+    _predict_imprint_ml = None
+
 # 섀도 모드 로그: 서빙되는 값(ML)은 그대로 두고, 규칙 기반 결과도 같이 계산해서
 # 둘이 일치하는지만 기록한다. ML/README.md의 검증 미해결 리스크(90.7%는
 # 스튜디오 참고사진 기준이라 실사용자 사진에서도 우위가 유지되는지 확인
@@ -41,6 +51,7 @@ except ImportError:
 # 않고 이 로그로 실측 우위를 확인한다. storage/ml_confirmations.jsonl(사용자가
 # 확정한 진짜 정답)과 나중에 대조하면 실제 정확도 비교도 가능하다.
 _SHADOW_LOG_PATH = Path(__file__).resolve().parent.parent / "storage" / "ml_shadow.jsonl"
+_IMPRINT_SHADOW_LOG_PATH = Path(__file__).resolve().parent.parent / "storage" / "imprint_shadow.jsonl"
 
 
 def _log_shadow_comparison(ml_shape: str, rule_shape: str) -> None:
@@ -57,23 +68,47 @@ def _log_shadow_comparison(ml_shape: str, rule_shape: str) -> None:
     except Exception:
         pass  # 로깅 실패가 실제 서빙(모양 판정 응답)을 막으면 안 된다
 
+
+def _log_imprint_shadow(ml_text: str, easyocr_text: str) -> None:
+    try:
+        _IMPRINT_SHADOW_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ml_text": ml_text,
+            "easyocr_text": easyocr_text,
+            "match": ml_text == easyocr_text,
+        }
+        with open(_IMPRINT_SHADOW_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # 로깅 실패가 실제 서빙(각인 응답)을 막으면 안 된다
+
 NAMED_COLORS = {
     # "ivory"는 DB(product.color_class1/2)에 단 1건도 없는 값이라(MFDS 원본
     # 데이터에 사실상 안 쓰임 - 실측 확인) 여기 팔레트에 있으면 흰색에
     # 가까운 알약이 최근접 매칭으로 ivory에 걸려 검색 결과가 0건이 되는
     # 버그가 생긴다. 그래서 일부러 뺐다 - 흰색 계열은 전부 "white"로
-    # 흡수되게 한다.
-    "white": (255, 255, 255),
-    "yellow": (255, 221, 51),
-    "orange": (255, 140, 40),
-    "pink": (255, 175, 190),
-    "red": (210, 40, 40),
-    "brown": (120, 75, 45),
-    "purple": (140, 80, 170),
-    "blue": (60, 100, 200),
-    "green": (70, 150, 80),
-    "gray": (150, 150, 150),
-    "black": (30, 30, 30),
+    # 흡수되게 한다. "clear"도 같은 이유(17건뿐 + 투명은 단일 RGB로 표현
+    # 자체가 애매함)로 뺐다.
+    #
+    # 2026-09-02: 손으로 고른 이상적 색상표에서, product.color_class1(정답
+    # 라벨) + storage/drug_image/(참고사진) 기준 실측 중앙값으로 재보정했다
+    # (ML/calibrate_color.py, 색상당 최대 300장 샘플). 계기: item_seq
+    # 196000011(DB 라벨 yellow)의 실제 추출 RGB(238,227,151)가 옛 yellow
+    # 기준색(255,221,51)보다 옛 pink 기준색(255,175,190)에 유클리드 거리상
+    # 더 가까워 "pink"로 오분류되는 게 실측 확인됨 - 파스텔톤/연한 색이 특히
+    # 취약했다. 재보정 후 이 케이스는 yellow로 정상 분류됨(거리 830 vs 2945).
+    "white": (235, 237, 235),
+    "yellow": (228, 206, 134),
+    "orange": (234, 181, 113),
+    "pink": (232, 174, 161),
+    "red": (158, 48, 40),
+    "brown": (118, 56, 41),
+    "purple": (111, 60, 125),
+    "blue": (100, 182, 205),
+    "green": (122, 193, 122),
+    "gray": (185, 192, 181),
+    "black": (44, 41, 39),
 }
 
 
@@ -311,19 +346,22 @@ def classify_shape(contour) -> str:
     return "other"
 
 
-def _classify_shape(contour) -> str:
-    """모양 판정 진입점. ML 모델(ML/models/shape_classifier.joblib)이 있으면
-    그걸 서빙하고, 없거나 실패하면 규칙 기반 classify_shape()로 폴백한다.
-    ML이 성공한 경우도 규칙 기반을 같이 계산해 storage/ml_shadow.jsonl에
-    일치 여부를 남긴다(섀도 모드 - 서빙 결과에는 영향 없음, _log_shadow_comparison
-    주석 참고)."""
+def _classify_shape(contour) -> tuple[str, float | None]:
+    """모양 판정 진입점. (모양, 신뢰도)를 돌려준다 - 신뢰도는 ML 서빙일 때만
+    0~1 값(RandomForest predict_proba), 규칙 기반 폴백이면 None(규칙 기반은
+    확률 개념이 없음).
+
+    ML 모델(ML/models/shape_classifier.joblib)이 있으면 그걸 서빙하고,
+    없거나 실패하면 규칙 기반 classify_shape()로 폴백한다. ML이 성공한
+    경우도 규칙 기반을 같이 계산해 storage/ml_shadow.jsonl에 일치 여부를
+    남긴다(섀도 모드 - 서빙 결과에는 영향 없음, _log_shadow_comparison 주석 참고)."""
     rule_result = classify_shape(contour)
     if _predict_shape_ml is not None:
-        predicted = _predict_shape_ml(contour)
+        predicted, confidence = _predict_shape_ml(contour)
         if predicted is not None:
             _log_shadow_comparison(predicted, rule_result)
-            return predicted
-    return rule_result
+            return predicted, confidence
+    return rule_result, None
 
 
 def _closest_named_color(bgr):
@@ -428,23 +466,32 @@ def _ocr_one_side(region: np.ndarray) -> str:
     return text if text and conf >= _OCR_CONFIDENCE_THRESHOLD else ""
 
 
-def extract_imprint(image: np.ndarray, contour) -> list[str]:
-    """알약 표면의 양각 각인을 읽어, 우선순위 순서의 후보 리스트를 돌려준다:
-    [합친 것(왼쪽+분할선+오른쪽), 왼쪽만, 오른쪽만] - 앞의 것일수록 정보량이
-    많지만(둘 다 맞아야 함) 그만큼 하나라도 틀리면 전체가 어긋난다. 한쪽만
-    맞춘 후보는 정보는 적어도 더 신뢰할 수 있다. 실제 DB 매칭(추후 작업)이
-    앞에서부터 순서대로 시도해보도록 이 순서를 그대로 유지해야 한다.
+def extract_imprint(image: np.ndarray, contour) -> tuple[list[str], float | None]:
+    """알약 표면의 양각 각인을 읽어, (우선순위 순서의 후보 리스트, ML 신뢰도)를
+    돌려준다. 신뢰도는 ML 경로가 서빙됐을 때만 0~1 값이고, EasyOCR 폴백이면
+    None이다(ML 자체를 못 써서 비교 대상이 없다는 뜻 - "신뢰도가 0"과는 다르다).
 
-    분할선(스코어라인)이 없으면 통짜로 읽는다(단일 후보 또는 빈 리스트).
-    있으면 좌/우로 나눠서 각각 읽는다 - 각인이 분할선을 사이에 두고 나뉜
-    경우(예: "V 8")가 흔하고 통짜로 읽으면 실패하기 쉽다. 결과는 DB
-    (product.print_front/print_back)에 실제 저장된 형식과 맞춰 "분할선"
-    토큰을 그대로 끼워 넣는다 - 그래야 LIKE 매칭으로 DB의 "V분할선8"과
-    바로 맞아떨어진다. 실측 확인: 모양+색상으로 좁힌 후보 중에서도 "분할선
-    있음 + 한쪽 글자 하나"만 맞아도 후보가 수십 건 수준으로 좁혀진다 -
-    양쪽 다 정확히 읽을 필요는 없다. 읽은 게 하나도 없으면(신뢰도 낮음
-    포함) 빈 리스트를 돌려준다 - 틀린 값을 억지로 채우는 것보다 모르면
-    모른다고 하는 게 낫다.
+    ML/models/imprint_crnn.pt(CRNN)가 있으면 그 예측을 최우선 후보로 서빙하고
+    (모양의 _classify_shape()와 같은 패턴), EasyOCR 결과는 섀도 로그로만 같이
+    남긴다(storage/imprint_shadow.jsonl). ML이 없거나 예측 실패 시에만 아래
+    EasyOCR 후보 목록을 그대로 서빙한다.
+
+    신뢰도를 서버가 임의 임계값으로 잘라서 숨기지 않고 그대로 응답에 실어
+    보낸다 - "마크"(로고/기호)나 각인 없는 뒷면처럼 학습에서 제외했던 입력엔
+    모델이 항상 뭔가 그럴듯하게 지어내는 게 실측 확인됐다(2026-09-03,
+    item_seq 196500051/195900001). 이런 경우를 서버가 완벽히 걸러낼 수 없으니,
+    신뢰도를 FE로 넘겨서 낮을 때 사용자 교정을 유도하는 판단은 FE/UX가 하게
+    한다.
+
+    EasyOCR 경로의 후보 순서는 [통짜, 합친 것(왼쪽+분할선+오른쪽), 왼쪽만,
+    오른쪽만]. 통짜는 분할선 오검출에 안전한 최우선 후보(_imprint_candidates_from_gray
+    참고), 합친 것은 정보량이 많지만(둘 다 맞아야 함) 하나라도 틀리면 전체가
+    어긋난다. 한쪽만 맞춘 후보는 정보는 적어도 더 신뢰할 수 있다. 실제 DB
+    매칭이 앞에서부터 순서대로 시도해보도록 이 순서를 그대로 유지해야 한다.
+    결과는 DB(product.print_front/print_back)에 실제 저장된 형식과 맞춰
+    "분할선" 토큰을 그대로 끼워 넣는다 - 그래야 LIKE 매칭으로 DB의
+    "V분할선8"과 바로 맞아떨어진다. 아무것도 못 읽으면 빈 리스트를 돌려준다 -
+    틀린 값을 억지로 채우는 것보다 모르면 모른다고 하는 게 낫다.
     """
     x, y, w, h = cv2.boundingRect(contour)
     pad = int(0.05 * max(w, h))
@@ -452,23 +499,50 @@ def extract_imprint(image: np.ndarray, contour) -> list[str]:
     x1, y1 = min(x + w + pad, image.shape[1]), min(y + h + pad, image.shape[0])
     crop = image[y0:y1, x0:x1]
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    if _predict_imprint_ml is not None:
+        predicted, confidence = _predict_imprint_ml(gray)
+        if predicted:
+            easyocr_candidates = _imprint_candidates_from_gray(gray)
+            _log_imprint_shadow(predicted, easyocr_candidates[0] if easyocr_candidates else "")
+            return [predicted], confidence
+
+    return _imprint_candidates_from_gray(gray), None
+
+
+def _imprint_candidates_from_gray(gray: np.ndarray) -> list[str]:
+    """이미 잘라낸(각인 영역만 남은) 흑백 크롭에서 후보 목록을 뽑는다.
+    extract_imprint()의 실제 로직 본체 - ML/build_dataset.py가 만드는 크롭도
+    같은 bounding-rect+5% 패딩 규칙이라, 그쪽에서 저장한 크롭 PNG를 그대로
+    이 함수에 넣으면 evaluate_imprint_model.py 같은 도구가 extract_imprint()와
+    똑같은 EasyOCR 경로를 재사용할 수 있다(원본 이미지+contour 없이도)."""
     gh, gw = gray.shape
 
-    divider_x = _detect_divider_x(gray)
+    # 통짜 인식은 분할선 유무와 상관없이 항상 먼저 시도한다. 원래는 분할선이
+    # 없을 때만 이 경로를 탔는데, 실측 확인(item_seq 197100081) 결과 진짜
+    # 분할선이 없는 두 글자짜리 각인(예: "KS")에서도 _detect_divider_x가
+    # 글자 획을 분할선으로 오검출해서 억지로 좌/우로 쪼개는 사례가 있었다 -
+    # "KS"(신뢰도 0.997로 깨끗이 읽힘)가 "분할선KS"로 나와 DB 매칭(정확한
+    # "KS")이 아예 안 맞게 되는 문제였다. 통짜 결과를 항상 최우선 후보로 두면
+    # 이런 오검출에 안전하다 - 진짜 분할선(홈)이 있는 경우는 그 홈이 글자
+    # 연속성을 끊어서 통짜 인식이 보통 실패하므로(원래 이 함수가 좌/우 분리
+    # 방식을 쓰는 이유), 실전에서 이 우선순위가 뒤바뀌는 부작용은 적다.
+    reader = _get_ocr_reader()
+    found = reader.readtext(gray, allowlist=_OCR_ALLOWLIST)
+    best = max(found, key=lambda r: r[2], default=None)
+    whole_text = best[1] if best and best[1] and best[2] >= _OCR_CONFIDENCE_THRESHOLD else ""
 
+    divider_x = _detect_divider_x(gray)
     if divider_x is None:
-        reader = _get_ocr_reader()
-        found = reader.readtext(gray, allowlist=_OCR_ALLOWLIST)
-        best = max(found, key=lambda r: r[2], default=None)
-        if best and best[1] and best[2] >= _OCR_CONFIDENCE_THRESHOLD:
-            return [best[1]]
-        return []
+        return [whole_text] if whole_text else []
 
     margin = int(gw * 0.06)
     left_text = _ocr_one_side(gray[:, : max(divider_x - margin, 0)])
     right_text = _ocr_one_side(gray[:, min(divider_x + margin, gw) :])
 
     candidates = []
+    if whole_text:
+        candidates.append(whole_text)
     if left_text and right_text:
         candidates.append(f"{left_text}분할선{right_text}")
     if left_text:
@@ -486,15 +560,23 @@ def analyze(image_path: str, with_imprint: bool = True) -> list:
     results = []
     for contour in segment_pills(image):
         mask = build_mask(image.shape, contour)
-        shape = _classify_shape(contour)
+        shape, shape_confidence = _classify_shape(contour)
         color_name, color_rgb = detect_color(image, mask)
-        entry = {"shape": shape, "color": color_name, "color_rgb": color_rgb, "contour": contour}
+        entry = {
+            "shape": shape,
+            "shape_confidence": shape_confidence,
+            "color": color_name,
+            "color_rgb": color_rgb,
+            "contour": contour,
+        }
         if with_imprint:
-            candidates = extract_imprint(image, contour)
+            candidates, imprint_confidence = extract_imprint(image, contour)
             entry["imprint"] = candidates[0] if candidates else "(인식 실패 - 흐리거나 대비가 낮음)"
             # 우선순위 순서([합친것, 왼쪽만, 오른쪽만]) 그대로 보존 - DB 매칭 쪽에서
             # 이 순서대로 하나씩 시도하는 건 추후 작업.
             entry["imprint_candidates"] = candidates
+            # ML 경로일 때만 0~1 값, EasyOCR 폴백이면 None(비교 대상 자체가 없다는 뜻).
+            entry["imprint_confidence"] = imprint_confidence
         results.append(entry)
     return results
 
@@ -511,13 +593,14 @@ def diagnose_from_mask(image: np.ndarray, mask: np.ndarray, with_imprint: bool =
         raise ValueError("마스크에서 영역을 찾지 못했습니다.")
     contour = max(contours, key=cv2.contourArea)
 
-    shape = _classify_shape(contour)
+    shape, shape_confidence = _classify_shape(contour)
     color_name, color_rgb = detect_color(image, mask)
-    result = {"shape": shape, "color": color_name, "color_rgb": color_rgb}
+    result = {"shape": shape, "shape_confidence": shape_confidence, "color": color_name, "color_rgb": color_rgb}
     if with_imprint:
-        candidates = extract_imprint(image, contour)
+        candidates, imprint_confidence = extract_imprint(image, contour)
         result["imprint"] = candidates[0] if candidates else ""
         result["imprint_candidates"] = candidates
+        result["imprint_confidence"] = imprint_confidence
     return result
 
 
