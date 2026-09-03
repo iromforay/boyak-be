@@ -113,6 +113,9 @@ NAMED_COLORS = {
 
 
 _FASTSAM_MODEL = None
+# 다른 학습 모델(ML/models/shape_classifier.joblib, imprint_crnn.pt)과 같은
+# 위치에 모아둔다 - 예전엔 저장소 루트에 따로 있었다.
+_FASTSAM_MODEL_PATH = Path(__file__).resolve().parent.parent / "ML" / "models" / "FastSAM-s.pt"
 
 
 def _get_fastsam_model():
@@ -120,7 +123,7 @@ def _get_fastsam_model():
     if _FASTSAM_MODEL is None:
         from ultralytics import FastSAM
 
-        _FASTSAM_MODEL = FastSAM("FastSAM-s.pt")
+        _FASTSAM_MODEL = FastSAM(str(_FASTSAM_MODEL_PATH))
     return _FASTSAM_MODEL
 
 
