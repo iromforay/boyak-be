@@ -27,7 +27,7 @@ import argparse
 import csv
 import random
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import cv2
 import numpy as np
@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader, Dataset
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 LABELS_CSV = DATA_DIR / "labels.csv"
+CROPS_DIR = DATA_DIR / "crops"
 MODELS_DIR = Path(__file__).resolve().parent / "models"
 DEFAULT_OUTPUT = MODELS_DIR / "imprint_crnn.pt"
 
@@ -158,12 +159,17 @@ def _ctc_greedy_decode(ids) -> list:
 
 
 def _load_rows() -> list:
+    """labels.csv를 읽는다. image_path 컬럼은 파일명만 저장돼 있는 게 정상이라
+    CROPS_DIR을 붙여서 이 환경(로컬/Colab 등) 기준 절대경로로 조립한다 - 예전
+    절대경로가 섞여 있어도(PurePath로 파싱해 basename만 취함) 안전하게 처리한다."""
     if not LABELS_CSV.is_file():
         raise FileNotFoundError(f"{LABELS_CSV} 가 없습니다 - 먼저 build_dataset.py를 실행하세요.")
     rows = []
     with open(LABELS_CSV, encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            rows.append((row["image_path"], row["text"], row["item_seq"]))
+            filename = PureWindowsPath(row["image_path"]).name if "\\" in row["image_path"] else Path(row["image_path"]).name
+            image_path = str(CROPS_DIR / filename)
+            rows.append((image_path, row["text"], row["item_seq"]))
     return rows
 
 
@@ -187,66 +193,66 @@ def _split_train_val(rows: list, val_ratio: float = 0.15, seed: int = 42):
 
 
 def train(epochs: int, batch_size: int, lr: float, output_path: Path) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"디바이스: {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # GPU 있으면 GPU, 없으면 CPU
+    print(f"디바이스: {device}")  # 지금 뭘로 도는지 확인용 출력
 
-    rows = _load_rows()
+    rows = _load_rows()  # labels.csv 전체를 (경로, 정답텍스트, item_seq) 리스트로 로드
     print(f"labels.csv 총 {len(rows)}건")
-    train_rows, val_rows = _split_train_val(rows)
+    train_rows, val_rows = _split_train_val(rows)  # item_seq 단위로 train/val 분리(같은 알약이 양쪽에 안 섞이게)
     print(f"train {len(train_rows)}건 / val {len(val_rows)}건 (item_seq 단위 분할)")
 
-    train_ds = ImprintDataset(train_rows)
-    val_ds = ImprintDataset(val_rows)
+    train_ds = ImprintDataset(train_rows)  # 학습용 - 라벨을 숫자 시퀀스로 토큰화까지 미리 해둠
+    val_ds = ImprintDataset(val_rows)  # 검증용 - 학습엔 안 쓰고 채점만 함
     print(f"토큰화 후 유효 샘플: train {len(train_ds)}건 / val {len(val_ds)}건")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=_collate, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=_collate, num_workers=0)  # 매 에폭 순서 섞어서 배치로 묶어줌
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate, num_workers=0)  # 검증은 순서 안 섞어도 됨
 
-    model = CRNN(NUM_CLASSES).to(device)
-    criterion = nn.CTCLoss(blank=BLANK_IDX, zero_infinity=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model = CRNN(NUM_CLASSES).to(device)  # 학습 안 된 빈 모델 생성 후 GPU/CPU로 올림
+    criterion = nn.CTCLoss(blank=BLANK_IDX, zero_infinity=True)  # "얼마나 틀렸나"를 계산하는 손실 함수
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)  # 그 틀린 정도로 가중치를 어떻게 고칠지 정하는 알고리즘
 
-    best_val_acc = -1.0
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0.0
-        for images, labels_concat, label_lengths in train_loader:
+    best_val_acc = -1.0  # 지금까지 최고 검증 정확도 - 이걸 넘을 때만 모델 저장
+    for epoch in range(1, epochs + 1):  # 전체 데이터를 epochs번 반복 학습
+        model.train()  # 학습 모드로 전환(드롭아웃 등 켜짐) - 가중치 갱신과는 별개
+        total_loss = 0.0  # 이번 에폭 누적 손실
+        for images, labels_concat, label_lengths in train_loader:  # 배치(기본 32~64장)씩 순회
             images, labels_concat, label_lengths = images.to(device), labels_concat.to(device), label_lengths.to(
                 device
-            )
-            optimizer.zero_grad()
-            logits = model(images)  # (B, T, C)
-            log_probs = logits.log_softmax(dim=-1).permute(1, 0, 2)  # CTCLoss는 (T, B, C)
-            input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long, device=device)
-            loss = criterion(log_probs, labels_concat, input_lengths, label_lengths)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * images.size(0)
+            )  # 이번 배치를 GPU/CPU 메모리로 이동
+            optimizer.zero_grad()  # 이전 배치의 기울기 찌꺼기 초기화
+            logits = model(images)  # (B, T, C)  # 순전파 - 지금 가중치로 예측
+            log_probs = logits.log_softmax(dim=-1).permute(1, 0, 2)  # CTCLoss는 (T, B, C)  # CTC가 요구하는 형태로 변환
+            input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long, device=device)  # 각 샘플의 시퀀스 길이(전부 동일)
+            loss = criterion(log_probs, labels_concat, input_lengths, label_lengths)  # 예측과 정답의 오차 계산
+            loss.backward()  # 역전파 - 오차를 각 가중치의 책임으로 분배
+            optimizer.step()  # 실제 가중치 갱신 - 진짜 "학습"이 일어나는 줄
+            total_loss += loss.item() * images.size(0)  # 평균 계산용으로 배치 손실 누적
 
-        avg_loss = total_loss / max(len(train_ds), 1)
+        avg_loss = total_loss / max(len(train_ds), 1)  # 이번 에폭의 샘플당 평균 손실
 
-        model.eval()
-        correct = 0
-        with torch.no_grad():
-            for images, labels_concat, label_lengths in val_loader:
+        model.eval()  # 평가 모드로 전환(드롭아웃 등 꺼짐) - 이제부터는 가중치 안 바꿈
+        correct = 0  # 검증셋에서 정확히 맞춘 샘플 수
+        with torch.no_grad():  # 검증은 역전파 필요 없으니 기울기 계산 자체를 꺼서 속도/메모리 절약
+            for images, labels_concat, label_lengths in val_loader:  # 검증 배치 순회
                 images = images.to(device)
-                logits = model(images)
-                preds = logits.argmax(dim=-1).cpu()
-                offset = 0
-                for i, length in enumerate(label_lengths.tolist()):
-                    target = labels_concat[offset : offset + length].tolist()
-                    offset += length
-                    pred_tokens = _ctc_greedy_decode(preds[i])
-                    if pred_tokens == target:
+                logits = model(images)  # 예측만 하고 손실/가중치 갱신은 안 함
+                preds = logits.argmax(dim=-1).cpu()  # 각 시점에서 가장 확률 높은 클래스 선택
+                offset = 0  # labels_concat(이어붙인 정답)에서 이번 샘플 구간을 잘라내기 위한 위치
+                for i, length in enumerate(label_lengths.tolist()):  # 배치 안 샘플 하나씩 채점
+                    target = labels_concat[offset : offset + length].tolist()  # 이 샘플의 정답 토큰
+                    offset += length  # 다음 샘플 구간으로 이동
+                    pred_tokens = _ctc_greedy_decode(preds[i])  # blank/중복 제거해서 예측 문자열로 복원
+                    if pred_tokens == target:  # 정답과 완전히 똑같아야만 정답 처리(부분 정답 인정 안 함)
                         correct += 1
-        val_acc = correct / max(len(val_ds), 1)
+        val_acc = correct / max(len(val_ds), 1)  # 검증셋 전체 기준 정답 비율
 
-        print(f"[epoch {epoch}/{epochs}] loss={avg_loss:.4f} val_exact_acc={val_acc*100:.1f}%")
+        print(f"[epoch {epoch}/{epochs}] loss={avg_loss:.4f} val_exact_acc={val_acc*100:.1f}%")  # 지금 보고 계신 그 로그 줄
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"model_state": model.state_dict(), "vocab": VOCAB}, output_path)
+        if val_acc > best_val_acc:  # 이번 에폭이 지금까지 중 제일 좋으면
+            best_val_acc = val_acc  # 최고 기록 갱신
+            output_path.parent.mkdir(parents=True, exist_ok=True)  # models/ 폴더 없으면 생성
+            torch.save({"model_state": model.state_dict(), "vocab": VOCAB}, output_path)  # 가중치+어휘를 파일로 저장(best만 남음)
             print(f"  best 갱신 - 저장: {output_path}")
 
     print(f"\n학습 완료. best val_exact_acc={best_val_acc*100:.1f}%, 모델: {output_path}")

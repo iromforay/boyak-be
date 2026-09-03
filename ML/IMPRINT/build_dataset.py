@@ -109,7 +109,12 @@ def _process_item(item_seq: str, print_front: str, print_back: str):
         crop = image[y0:y1, x0:x1]
         crop_path = CROPS_DIR / f"{item_seq}_{side}.png"
         cv2.imwrite(str(crop_path), crop)
-        rows.append((str(crop_path), label, item_seq, side))
+        # image_path는 파일명만 저장한다(CROPS_DIR 기준 상대) - 로컬 절대경로를
+        # 그대로 넣으면 Colab 등 다른 환경으로 옮겼을 때 경로가 안 맞아 전부
+        # 못 읽는다(train_shape_classifier.py 캐시 서명 때 겪은 것과 같은 종류의
+        # 이식성 문제). 실제 로드는 train_imprint_model.py가 DATA_DIR/crops를
+        # 기준으로 다시 조립한다.
+        rows.append((crop_path.name, label, item_seq, side))
 
     if not rows:
         return "no_label", []
@@ -135,7 +140,7 @@ def _recover_orphan_labels(rows_db: list) -> int:
     for p in CROPS_DIR.glob("*.png"):
         item_seq, _, side = p.stem.rpartition("_")
         if (item_seq, side) not in labeled:
-            orphans.append((item_seq, side, str(p)))
+            orphans.append((item_seq, side, p.name))
     if not orphans:
         return 0
 
