@@ -16,6 +16,9 @@ React 프론트가 직접 호출하는 API. 중간 단계 없이 파이썬이 �
   POST /correct_label (JSON: image_path, target_id, points, field, value)
                       -> 탐지 영역은 맞는데 모양/색상/각인 라벨만 틀렸을 때
                          마스킹 없이 바로 정답 교정 (재학습용 raw 데이터로 축적)
+  POST /signup       (JSON: uuid, name, age) -> 로그인 없는 UUID 기반 최소 가입
+  GET  /users/{uuid} -> 프로필(튜토리얼 완료 여부 포함) 조회
+  PATCH /users/{uuid}/tutorial (JSON: completed) -> 튜토리얼 완료/재설정
   GET  /images/{name} -> 업로드된 이미지 정적 서빙
   GET  /health
 
@@ -37,6 +40,7 @@ from typing import Optional, Union
 
 import cv2
 import numpy as np
+import pymysql
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -46,8 +50,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from diagnose import diagnose as diagnose_image  # noqa: E402
 from pill_analyze import diagnose_from_mask  # noqa: E402
 from app.services.pill_service import PillService  # noqa: E402
+from app.models.user_model import UserModel  # noqa: E402
 
 pill_service = PillService()
+user_model = UserModel()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STORAGE_DIR = BASE_DIR / "storage" / "images"
@@ -111,6 +117,17 @@ class CorrectLabelRequest(BaseModel):
     points: list  # /upload가 내려준 정규화(0~1) 폴리곤 좌표 그대로 - 탐지 영역 자체는 맞음
     field: str  # "shape" | "color" | "imprint"
     value: str
+
+
+class SignupRequest(BaseModel):
+    uuid: str
+    name: str
+    age: int
+    platform: str = "web"  # "web" | "app" - FE가 네이티브 앱 웹뷰인지 구분해서 보낸다
+
+
+class TutorialStatusRequest(BaseModel):
+    completed: bool
 
 
 def _decode_mask_png(mask_b64: str, shape) -> np.ndarray:
@@ -384,6 +401,51 @@ def correct_label(body: CorrectLabelRequest):
         raise
     except Exception:
         pass  # 학습 데이터 저장 실패가 사용자 응답을 막으면 안 된다
+    return {"status": "ok"}
+
+
+@app.post("/signup")
+def signup(body: SignupRequest):
+    """하이브리드 앱 최초 실행 시 이름/나이만 받아 기기 UUID로 가입한다
+    (로그인/비밀번호 없음). 이미 가입된 UUID면 새로 만들지 않고 기존
+    정보를 그대로 돌려준다 - 앱이 같은 UUID로 재요청하는 경우(재실행 등)
+    대비."""
+    if body.platform not in ("web", "app"):
+        raise HTTPException(400, f"알 수 없는 platform 입니다: {body.platform}")
+    try:
+        existing = user_model.find_by_uuid(body.uuid)
+        if existing:
+            return existing
+        return user_model.create(body.uuid, body.name, body.age, body.platform)
+    except pymysql.MySQLError:
+        # DB 연결이 잠깐 끊긴 경우 - 처리 안 된 예외로 그냥 죽으면 FastAPI가
+        # CORS 헤더 없는 500을 내려보내 브라우저에는 "CORS 오류"로만 보이고
+        # 원인을 알 수 없게 된다(가입 화면 전체가 막힌 것처럼 보임). 503으로
+        # 명확히 응답해 FE가 재시도를 유도할 수 있게 한다.
+        raise HTTPException(503, "일시적인 오류입니다. 잠시 후 다시 시도해주세요.")
+
+
+@app.get("/users/{user_uuid}")
+def get_user(user_uuid: str):
+    """가입 여부 확인 및 프로필(튜토리얼 완료 여부 포함) 조회."""
+    try:
+        user = user_model.find_by_uuid(user_uuid)
+    except pymysql.MySQLError:
+        raise HTTPException(503, "일시적인 오류입니다. 잠시 후 다시 시도해주세요.")
+    if not user:
+        raise HTTPException(404, "가입되지 않은 사용자입니다.")
+    return user
+
+
+@app.patch("/users/{user_uuid}/tutorial")
+def set_tutorial_status(user_uuid: str, body: TutorialStatusRequest):
+    """튜토리얼 완료 처리, 또는 설정 화면에서 '다시 보기' 선택 시 false로 리셋."""
+    try:
+        if not user_model.find_by_uuid(user_uuid):
+            raise HTTPException(404, "가입되지 않은 사용자입니다.")
+        user_model.set_tutorial_completed(user_uuid, body.completed)
+    except pymysql.MySQLError:
+        raise HTTPException(503, "일시적인 오류입니다. 잠시 후 다시 시도해주세요.")
     return {"status": "ok"}
 
 
