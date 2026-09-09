@@ -19,6 +19,9 @@ React 프론트가 직접 호출하는 API. 중간 단계 없이 파이썬이 �
   POST /signup       (JSON: uuid, name, age) -> 로그인 없는 UUID 기반 최소 가입
   GET  /users/{uuid} -> 프로필(튜토리얼 완료 여부 포함) 조회
   PATCH /users/{uuid}/tutorial (JSON: completed) -> 튜토리얼 완료/재설정
+  GET  /app_version_check?version_code=&platform= -> 최소 허용 버전 통과 여부.
+                      앱이 FE(/intro)를 열 때 넘긴 버전을 FE가 그대로 실어 호출.
+                      거절 시 store_url도 같이 내려주고 FE가 그리로 이동시킨다
   GET  /images/{name} -> 업로드된 이미지 정적 서빙
   GET  /health
 
@@ -51,9 +54,11 @@ from diagnose import diagnose as diagnose_image  # noqa: E402
 from pill_analyze import diagnose_from_mask  # noqa: E402
 from app.services.pill_service import PillService  # noqa: E402
 from app.models.user_model import UserModel  # noqa: E402
+from app.models.app_version_model import AppVersionModel  # noqa: E402
 
 pill_service = PillService()
 user_model = UserModel()
+app_version_model = AppVersionModel()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STORAGE_DIR = BASE_DIR / "storage" / "images"
@@ -271,6 +276,25 @@ def _to_pills(results: list, w: int, h: int) -> list:
             }
         )
     return pills
+
+
+@app.get("/app_version_check")
+def app_version_check(version_code: str, platform: str = "android"):
+    """네이티브 앱이 FE(/intro)를 열 때 자기 버전을 쿼리파라미터로 넘기고,
+    FE가 그 값을 그대로 실어 호출한다. platform은 지금은 android만
+    대상이고(web은 항상 통과). 해당 platform+version_code가 테이블에
+    등록돼 있고 is_active면 통과, 그 외(미등록 포함)는 전부 거절이다.
+    거절이면 FE가 store_url로 구글 플레이스토어로 넘긴다."""
+    if platform != "android":
+        return {"allowed": True}
+    try:
+        row = app_version_model.get_by_version(platform, version_code)
+        if row is not None and row["is_active"]:
+            return {"allowed": True}
+        store_url = row["store_url"] if row is not None else app_version_model.get_latest_store_url(platform)
+    except pymysql.MySQLError:
+        raise HTTPException(503, "일시적인 오류입니다. 잠시 후 다시 시도해주세요.")
+    return {"allowed": False, "store_url": store_url}
 
 
 @app.get("/health")

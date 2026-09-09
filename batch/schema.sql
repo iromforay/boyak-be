@@ -38,7 +38,7 @@ CREATE TABLE `product` (
   `mark_code_front`        VARCHAR(255)            COMMENT '앞면 각인 코드',
   `mark_code_back`         VARCHAR(255)            COMMENT '뒷면 각인 코드',
   `change_date`            VARCHAR(20)             COMMENT '변경일자 (API 원본 문자열)',
-  `edi_code`               VARCHAR(20)             COMMENT '보험코드(EDI 코드)',
+  `edi_code`               VARCHAR(100)            COMMENT '보험코드(EDI 코드) - 정상값은 9자리 숫자지만 드물게 더 긴/복합 값이 와서 넉넉히 잡음',
   `reg_date`               DATETIME                COMMENT '최초 등록 일시 (배치 자체 기록)',
   `up_date`                DATETIME                COMMENT '최종 수정 일시 (배치 자체 기록)',
   PRIMARY KEY (`idx`),
@@ -66,3 +66,44 @@ CREATE TABLE `cache` (
   PRIMARY KEY (`idx`),
   UNIQUE KEY `uq_key` (`key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 하이브리드 앱 최소 가입: 로그인/비밀번호 없이 기기별 UUID로 식별하고
+-- 이름/나이만 받는다. 튜토리얼 1회 노출 여부를 서버에도 남겨, 재설치 후
+-- 같은 UUID로 다시 붙어도(로컬 스토리지가 남아있다면) 상태를 복구할 수 있게 한다.
+-- idx(AUTO_INCREMENT PK) + uuid(UNIQUE KEY) 구조는 product/common/cache와 동일한
+-- 저장소 컨벤션을 따른 것.
+CREATE TABLE `users` (
+  `idx`                 INT UNSIGNED      NOT NULL AUTO_INCREMENT,
+  `uuid`                VARCHAR(36)       NOT NULL COMMENT '기기별 UUID (FE crypto.randomUUID)',
+  `name`                VARCHAR(50)       NOT NULL,
+  `age`                 SMALLINT UNSIGNED NOT NULL,
+  `tutorial_completed`  BOOLEAN           NOT NULL DEFAULT FALSE,
+  -- 'web'(순수 브라우저) | 'app'(하이브리드 앱 웹뷰) - 웹뷰 래퍼가 아직 없어
+  -- 지금은 전부 web으로 들어온다. FCM 푸시는 웹에서는 보낼 수 없으니, 앱이
+  -- 생기면 이 값으로 발송 대상을 걸러낸다.
+  `platform`            VARCHAR(10)       NOT NULL DEFAULT 'web',
+  `created_at`          DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`idx`),
+  UNIQUE KEY `uq_uuid` (`uuid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='앱 사용자 (로그인 없는 UUID 기반 최소 가입)';
+
+-- 하이브리드 앱 강제 업데이트 정책. 최소버전 이상이면 통과시키는 방식이
+-- 아니라, 출시된 버전을 하나하나 등록해두고 그 버전의 사용유무(is_active)만
+-- 본다 - 특정 버전에서만 심각한 버그가 나온 경우에도(반드시 최신이 아니어도)
+-- 그 버전만 콕 집어 막을 수 있다. 네이티브 껍데기가 FE(/intro)를 열 때
+-- 자기 버전을 같이 넘기고, FE가 그 값 그대로 BE에 질의한다. 등록되지 않은
+-- 버전은 무조건 실패로 본다(신규 출시 시 등록을 빼먹으면 그 버전 전체가
+-- 막히므로, 배포 체크리스트에 이 테이블 등록을 포함시켜야 한다).
+CREATE TABLE `app_version_policy` (
+  `idx`            INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `platform`       VARCHAR(10)  NOT NULL COMMENT '지금은 android만 사용',
+  `version_code`   VARCHAR(20)  NOT NULL COMMENT '네이티브 버전 문자열 (예: "3", "0.51", "0.51c") - 숫자 비교 안 하고 문자열로 그대로 대조',
+  `is_active`      BOOLEAN      NOT NULL DEFAULT TRUE COMMENT '이 버전 접속 허용 여부',
+  `store_url`      VARCHAR(500) NOT NULL COMMENT '거절 시 이동시킬 구글 플레이스토어 URL',
+  `reg_date`       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `up_date`        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`idx`),
+  UNIQUE KEY `uq_platform_version` (`platform`, `version_code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='하이브리드 앱 출시 버전별 사용유무 (platform+version_code 단위 등록)';
