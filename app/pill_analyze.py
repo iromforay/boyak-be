@@ -469,6 +469,76 @@ def _ocr_one_side(region: np.ndarray) -> str:
     return text if text and conf >= _OCR_CONFIDENCE_THRESHOLD else ""
 
 
+# 각인 인식 모델(CRNN)은 글자가 똑바로 선 스튜디오 참고사진으로만 학습돼서, 알약이
+# 돌아가 있으면 거의 못 읽는다. 재학습 없이 보완하려고 알약을 여러 각도로 되돌려
+# 각각 추론하고 신뢰도가 가장 높은 결과를 쓴다. 측정(2026-11-13, 검증셋 2,300건을
+# 임의 각도로 회전): 정확 일치율 8.0% -> 51.0%. 반대로 처음부터 똑바로 찍힌 입력은
+# 75.7% -> 62.3%로 떨어진다(다른 각도의 오독이 더 높은 신뢰도로 뽑히는 경우) -
+# 실사용 사진은 알약 방향이 제각각이라 전체로는 이득이 훨씬 크다고 보고 적용했다.
+_IMPRINT_ELONGATED_RATIO = 1.25  # 이 이상 길쭉하면 장축 방향을 알 수 있어 0/180도 2개만 본다
+_IMPRINT_ROUND_ANGLE_STEP = 30  # 원형 계열은 방향을 알 수 없어 이 간격으로 한 바퀴 돌려 본다
+# 신뢰도 1위가 틀린 각도의 오독인 경우가 적지 않아서(후보 안에 정답이 있는 비율 64%,
+# 1위만 쓰면 51%), 상위 몇 개를 같이 내려보내 DB 대조(PillService.find_drugs)가
+# 실제 존재하는 각인과 가장 잘 맞는 것을 고르게 한다.
+_IMPRINT_MAX_CANDIDATES = 3
+
+
+def _imprint_rotation_candidates(image: np.ndarray, contour, gray: np.ndarray) -> list[np.ndarray]:
+    """각인 인식에 넣어볼 회전 후보 크롭(흑백)들을 만든다. gray는 기존 방식의
+    축 정렬 크롭(bounding-rect + 5% 패딩)이다."""
+    (cx, cy), (rw, rh), _ = cv2.minAreaRect(contour)
+    long_side, short_side = max(rw, rh), min(rw, rh)
+    if short_side <= 0:
+        return [gray]
+
+    if long_side / short_side >= _IMPRINT_ELONGATED_RATIO:
+        # 길쭉한 알약: 회전 사각형의 장축이 수평이 되도록 펴서 잘라낸다. 각도 부호
+        # 규약에 기대지 않고 꼭짓점에서 장축/단축 방향 벡터를 직접 구한다.
+        box = cv2.boxPoints(((cx, cy), (rw, rh), _))
+        edge_a, edge_b = box[1] - box[0], box[2] - box[1]
+        long_edge, short_edge = (edge_a, edge_b) if np.linalg.norm(edge_a) >= np.linalg.norm(edge_b) else (edge_b, edge_a)
+        u = long_edge / (np.linalg.norm(long_edge) + 1e-6)
+        v = short_edge / (np.linalg.norm(short_edge) + 1e-6)
+        if u[0] * v[1] - u[1] * v[0] < 0:
+            v = -v  # 좌우가 뒤집힌(거울상) 변환이 되지 않게 방향을 맞춘다
+        pad = 0.05 * long_side
+        out_w, out_h = int(round(long_side + 2 * pad)), int(round(short_side + 2 * pad))
+        center = np.array([cx, cy], dtype=np.float32)
+        src = np.float32([center, center + u * long_side / 2, center + v * short_side / 2])
+        dst = np.float32(
+            [[out_w / 2, out_h / 2], [out_w / 2 + long_side / 2, out_h / 2], [out_w / 2, out_h / 2 + short_side / 2]]
+        )
+        matrix = cv2.getAffineTransform(src, dst)
+        full_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        aligned = cv2.warpAffine(
+            full_gray, matrix, (out_w, out_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+        )
+        return [aligned, cv2.rotate(aligned, cv2.ROTATE_180)]
+
+    # 원형 계열: 돌려도 알약이 크롭 안에 그대로 있으므로 크롭 자체를 제자리에서 돌린다.
+    h, w = gray.shape
+    candidates = [gray]
+    for angle in range(_IMPRINT_ROUND_ANGLE_STEP, 360, _IMPRINT_ROUND_ANGLE_STEP):
+        matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        candidates.append(
+            cv2.warpAffine(gray, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        )
+    return candidates
+
+
+def _predict_imprint_rotated(image: np.ndarray, contour, gray: np.ndarray) -> list[tuple[str, float]]:
+    """회전 후보마다 각인 모델을 돌려, 서로 다른 판독 문자열을 신뢰도 높은 순으로
+    최대 _IMPRINT_MAX_CANDIDATES개 돌려준다([(문자열, 신뢰도), ...]). 같은 문자열이
+    여러 각도에서 나오면 가장 높은 신뢰도 하나만 남긴다. 아무것도 못 읽으면 빈 리스트."""
+    best_by_text = {}
+    for candidate in _imprint_rotation_candidates(image, contour, gray):
+        text, confidence = _predict_imprint_ml(candidate)
+        if text and confidence > best_by_text.get(text, 0.0):
+            best_by_text[text] = confidence
+    ranked = sorted(best_by_text.items(), key=lambda item: item[1], reverse=True)
+    return ranked[:_IMPRINT_MAX_CANDIDATES]
+
+
 def extract_imprint(image: np.ndarray, contour) -> tuple[list[str], float | None]:
     """알약 표면의 양각 각인을 읽어, (우선순위 순서의 후보 리스트, ML 신뢰도)를
     돌려준다. 신뢰도는 ML 경로가 서빙됐을 때만 0~1 값이고, EasyOCR 폴백이면
@@ -504,11 +574,12 @@ def extract_imprint(image: np.ndarray, contour) -> tuple[list[str], float | None
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
     if _predict_imprint_ml is not None:
-        predicted, confidence = _predict_imprint_ml(gray)
-        if predicted:
+        ranked = _predict_imprint_rotated(image, contour, gray)
+        if ranked:
+            predicted, confidence = ranked[0]
             easyocr_candidates = _imprint_candidates_from_gray(gray)
             _log_imprint_shadow(predicted, easyocr_candidates[0] if easyocr_candidates else "")
-            return [predicted], confidence
+            return [text for text, _ in ranked], confidence
 
     return _imprint_candidates_from_gray(gray), None
 

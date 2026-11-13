@@ -6,7 +6,8 @@ React 프론트가 직접 호출하는 API. 중간 단계 없이 파이썬이 �
   POST /upload       (multipart, field "image") -> 저장 + 분석 결과 반환
   POST /reanalyze    (JSON: image_path, target_id, mask_png_base64)
                       -> 마스크로 즉시 재진단 + 학습용 교정 데이터 저장
-  POST /drug_lookup  (JSON: shape, color) -> 모양+색상으로 약 이름 후보 조회
+  POST /drug_lookup  (JSON: shape, color, imprint, imprint_candidates)
+                      -> 모양+색상(+각인)과 잘 맞는 순서로 약 이름 후보 조회
   POST /reject_target (JSON: image_path, target_id, shape, color, points)
                       -> 오검출(미대상) 기록 (검출 단계 재학습용 음성 예제)
   POST /confirm_result (JSON: image_path, target_id, item_seq)
@@ -100,6 +101,9 @@ class DrugLookupRequest(BaseModel):
     shape: str
     color: str
     imprint: Optional[str] = None
+    # /upload, /reanalyze가 내려준 imprint_candidates를 그대로 실어 보낸다(선택).
+    # 사용자가 각인을 직접 고쳤으면 고친 값만 믿어야 하므로 보내지 않는다.
+    imprint_candidates: Optional[list[str]] = None
 
 
 class RejectTargetRequest(BaseModel):
@@ -269,6 +273,9 @@ def _to_pills(results: list, w: int, h: int) -> list:
                 "color_label": pill_service.get_color_label(r["color"]),
                 "color_rgb": list(r["color_rgb"]),
                 "imprint": r.get("imprint", ""),
+                # 판독 후보 전체(신뢰도 높은 순, 첫 번째가 imprint와 같음) - FE가
+                # /drug_lookup에 그대로 넘기면 DB 대조가 차순위 후보까지 활용한다.
+                "imprint_candidates": r.get("imprint_candidates", []),
                 # ML(CRNN)이 서빙됐을 때만 0~1 값, EasyOCR 폴백이면 null - FE가 낮은
                 # 신뢰도일 때 사용자 교정을 유도할지 판단하는 근거로 쓴다.
                 "imprint_confidence": r.get("imprint_confidence"),
@@ -372,6 +379,7 @@ def reanalyze(body: ReanalyzeRequest):
         "color_label": pill_service.get_color_label(result["color"]),
         "color_rgb": list(result["color_rgb"]),
         "imprint": result.get("imprint", ""),
+        "imprint_candidates": result.get("imprint_candidates", []),
         "imprint_confidence": result.get("imprint_confidence"),
     }
 
@@ -380,7 +388,7 @@ def reanalyze(body: ReanalyzeRequest):
 def drug_lookup(body: DrugLookupRequest):
     """모양+색상(+각인)으로 후보 약을 찾는다 (결과화면에서 사용, '약 찾기').
     실제 DB(product 테이블, batch가 채워 넣음) 조회 결과를 돌려준다."""
-    drugs = pill_service.find_drugs(body.shape, body.color, body.imprint)
+    drugs = pill_service.find_drugs(body.shape, body.color, body.imprint, body.imprint_candidates)
     return {
         "shape_label": pill_service.get_shape_label(body.shape),
         "color_label": pill_service.get_color_label(body.color),
